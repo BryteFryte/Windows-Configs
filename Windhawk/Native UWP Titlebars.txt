@@ -1,0 +1,176 @@
+// ==WindhawkMod==
+// @id              native-uwp-titlebars
+// @name            Native titlebars in UWP apps
+// @description     Replaces the titlebars of UWP apps with Windows native ones
+// @version         1.0
+// @include         ApplicationFrameHost.exe
+// @include         explorer.exe
+// @architecture    x86-64
+// @compilerOptions -luser32 -lcomctl32 -ldwmapi -ldxguid -luuid
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+
+Removes the UWP titlebars and replaces them with native Win32 titlebars, taken from the current visual theme.
+
+*/
+// ==/WindhawkModReadme==
+
+#include <windhawk_utils.h>
+#include <CommCtrl.h>
+#include <dwmapi.h>
+
+typedef INT64 (*CTitleBar__PaintButton_t)(INT64, INT64, INT64, UINT, int *, DWORD);
+CTitleBar__PaintButton_t CTitleBar__PaintButton_orig;
+INT64 __fastcall CTitleBar__PaintButton_hook(
+    INT64 a1,
+    INT64 a2,
+    INT64 a3,
+    UINT a4,
+    int *a5,
+    DWORD a6)
+{
+    return 0;
+}
+
+LRESULT CALLBACK SubclassProc(
+    HWND hWnd,
+    UINT uMsg,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR uIdSubclass,
+    DWORD_PTR dwRefData)
+{
+    if (uMsg == WM_NCDESTROY)
+    {
+        RemoveWindowSubclass(hWnd, SubclassProc, uIdSubclass);
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    }
+    
+    if (uMsg == WM_NCPAINT || uMsg == WM_NCCALCSIZE)
+    {
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+    
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+typedef HWND (*CreateWindowInBandEx_t)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID, DWORD, DWORD);
+CreateWindowInBandEx_t CreateWindowInBandEx_orig;
+HWND WINAPI CreateWindowInBandEx_hook(
+    DWORD dwExStyle,
+    LPCWSTR lpClassName,
+    LPCWSTR lpWindowName,
+    DWORD dwStyle,
+    int x,
+    int y,
+    int nWidth,
+    int nHeight,
+    HWND hWndParent,
+    HMENU hMenu,
+    HINSTANCE hInstance,
+    LPVOID lpParam,
+    DWORD dwBand,
+    DWORD dwTypeFlags)
+{
+    dwExStyle |= WS_EX_DLGMODALFRAME;
+    dwExStyle &= ~0x00200000L; // WS_EX_NOREDIRECTIONBITMAP
+    dwStyle = WS_OVERLAPPEDWINDOW | WS_DLGFRAME;
+
+    HWND res = CreateWindowInBandEx_orig(dwExStyle, lpClassName, lpWindowName, dwStyle, x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam, dwBand, dwTypeFlags);
+    
+    if (res != NULL)
+    {
+        SetWindowSubclass(res, SubclassProc, 1, 0);
+    }
+    return res;
+}
+
+// Hook SetWindowPos to hide titlebar windows instead of blocking their creation
+typedef BOOL (WINAPI *SetWindowPos_t)(HWND, HWND, int, int, int, int, UINT);
+SetWindowPos_t SetWindowPos_orig;
+BOOL WINAPI SetWindowPos_hook(
+    HWND hWnd,
+    HWND hWndInsertAfter,
+    int X,
+    int Y,
+    int cx,
+    int cy,
+    UINT uFlags)
+{
+    if (hWnd)
+    {
+        WCHAR wszClassName[64] = {0};
+        GetClassNameW(hWnd, wszClassName, ARRAYSIZE(wszClassName));
+        
+        if (!wcscmp(wszClassName, L"ApplicationFrameTitleBarWindow"))
+        {
+            // Hide the titlebar window by moving it off-screen and making it zero-size
+            return SetWindowPos_orig(hWnd, hWndInsertAfter, -32000, -32000, 0, 0, uFlags | SWP_HIDEWINDOW);
+        }
+    }
+    
+    return SetWindowPos_orig(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+}
+
+// Hook ShowWindow to prevent titlebar window from being shown
+typedef BOOL (WINAPI *ShowWindow_t)(HWND, int);
+ShowWindow_t ShowWindow_orig;
+BOOL WINAPI ShowWindow_hook(HWND hWnd, int nCmdShow)
+{
+    if (hWnd)
+    {
+        WCHAR wszClassName[64] = {0};
+        GetClassNameW(hWnd, wszClassName, ARRAYSIZE(wszClassName));
+        
+        if (!wcscmp(wszClassName, L"ApplicationFrameTitleBarWindow"))
+        {
+            return ShowWindow_orig(hWnd, SW_HIDE);
+        }
+    }
+    return ShowWindow_orig(hWnd, nCmdShow);
+}
+
+typedef HRESULT (WINAPI *DwmExtendFrameIntoClientArea_t)(HWND, const MARGINS *);
+DwmExtendFrameIntoClientArea_t DwmExtendFrameIntoClientArea_orig;
+HRESULT WINAPI DwmExtendFrameIntoClientArea_hook(
+    HWND hWnd,
+    const MARGINS *pMarInset)
+{
+    WCHAR wszClassName[32] = {0};
+    GetClassNameW(hWnd, wszClassName, ARRAYSIZE(wszClassName));
+    
+    if (!wcscmp(wszClassName, L"ApplicationFrameWindow"))
+    {
+        return 0x80263001; // DWM_E_COMPOSITIONDISABLED
+    }
+    
+    return DwmExtendFrameIntoClientArea_orig(hWnd, pMarInset);
+}
+
+BOOL Wh_ModInit()
+{
+    Wh_Log(L"Init");
+
+    Wh_SetFunctionHook((void *)GetProcAddress(LoadLibraryW(L"user32.dll"), "CreateWindowInBandEx"), (void *)CreateWindowInBandEx_hook, (void **)&CreateWindowInBandEx_orig);
+    Wh_SetFunctionHook((void *)SetWindowPos, (void *)SetWindowPos_hook, (void **)&SetWindowPos_orig);
+    Wh_SetFunctionHook((void *)ShowWindow, (void *)ShowWindow_hook, (void **)&ShowWindow_orig);
+    Wh_SetFunctionHook((void *)DwmExtendFrameIntoClientArea, (void *)DwmExtendFrameIntoClientArea_hook, (void **)&DwmExtendFrameIntoClientArea_orig);
+
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {L"private: long __cdecl CTitleBar::_PaintButton(struct IDCompositionSurface *,enum CTitleBar::TitleBarControl,enum TITLE_BAR_BITMAP_TYPE,struct tagRECT const &,struct tagRECT const &)"},
+            (void **)&CTitleBar__PaintButton_orig,
+            (void *)CTitleBar__PaintButton_hook,
+            false
+        },
+    };
+
+    if (!WindhawkUtils::HookSymbols(LoadLibraryW(L"ApplicationFrame.dll"), hooks, ARRAYSIZE(hooks)))
+    {
+        Wh_Log(L"Failed to hook some symbols");
+    }
+
+    return TRUE;
+}

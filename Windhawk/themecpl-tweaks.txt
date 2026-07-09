@@ -1,0 +1,280 @@
+// ==WindhawkMod==
+// @id              themecpl-tweaks
+// @name            Personalization Tweaks (final upd)
+// @version         1.0
+// @author          xalejandro
+// @github          https://github.com/tetawaves
+// @include         explorer.exe
+// @compilerOptions -lgdi32 -loleaut32
+// @architecture    x86-64
+// ==/WindhawkMod==
+
+
+// ==WindhawkModSettings==
+/*
+- corner_radius: 30
+  $name: Color swatch corner radius
+- basic_name: "Windows 7 Basic"
+  $name: Basic swatch name
+- classic_name: "Windows Classic"
+  $name: Classic swatch name
+*/
+// ==/WindhawkModSettings==
+
+#include <windhawk_utils.h>
+#include <stringapiset.h>
+#include <strsafe.h>
+#include <shlwapi.h>
+
+#define CThemeThumbnail_CThemeFile(pThis) (CThemeFile*)*((unsigned long long *)pThis + 9);
+#define CThemeThumbnail_HdcDest(pThis) *((HDC *)pThis + 12);
+#define CThemeThumbnail_RectSwatch(pThis) *(RECT *)((char *)pThis + 408);
+
+struct CThemeFile {};
+
+// Hardcoded values in themeui.dll, they do not scale with DPI and are always the same
+RECT rectColorSwatch = {3, 3, 253, 253};
+RECT rectThumbnailColorSwatch = {3, 137, 253, 387};
+
+int g_cornerRadius = 0;
+UINT g_swatchType = 0;
+
+WindhawkUtils::StringSetting g_basicName;
+WindhawkUtils::StringSetting g_classicName;
+
+enum SwatchImage
+{
+    None = 0,
+    BasicSwatch,
+    ClassicSwatch
+};
+
+HBITMAP (*PremultiplyLoadBitmap)(HINSTANCE, int);
+HRESULT (*AlphaDrawImage)(HDC, HBITMAP, RECT);
+HRESULT (*CThemeFile__getIntSetting)(void *, LPWSTR, LPWSTR, int, void *);
+HRESULT (*CThemeFile__getThemeSetting)(void *, LPWSTR, LPWSTR, void *, void *);
+
+void (*AlphaFillRegion_orig)(HDC, DWORD, HRGN, RECT);
+void AlphaFillRegion_hook(HDC hDC, DWORD argb, HRGN hRGN, RECT rc)
+{
+    if (EqualRect(&rc, &rectColorSwatch) || EqualRect(&rc, &rectThumbnailColorSwatch))
+    {
+        hRGN = CreateRoundRectRgn(
+            rc.left, 
+            rc.bottom, 
+            rc.right, 
+            rc.top, 
+            g_cornerRadius, 
+            g_cornerRadius);
+    }
+    return AlphaFillRegion_orig(hDC, argb, hRGN, rc);
+}
+
+BOOL getType(void *pThis, void *pThemeFile) {
+   if (pThemeFile) {
+        int basicint = 0;
+        PCWSTR classicstr = L"default";
+
+        if SUCCEEDED(CThemeFile__getIntSetting((CThemeFile *)((char *)pThemeFile - 16), L"VisualStyles", L"Composition", 1, &basicint))
+        {
+            if (basicint == 0) { return 1; }
+        }
+
+        if SUCCEEDED(CThemeFile__getThemeSetting((CThemeFile *)((char *)pThemeFile - 16), L"VisualStyles", L"ColorStyle", 0, &classicstr))
+        {
+            if (wcsstr(classicstr, L"@themeui.dll,-854")) {
+                return 2;
+            }
+        }
+   }
+
+   return 0;
+}
+
+void (*CThemeThumbnail___RenderColorSwatch_orig)(void *pThis);
+void CThemeThumbnail___RenderColorSwatch_hook(void *pThis)
+{
+    CThemeFile* pThemeFile = CThemeThumbnail_CThemeFile(pThis);
+    HINSTANCE hThemeui = GetModuleHandleW(L"themeui.dll");
+
+    HDC hdcDest = CThemeThumbnail_HdcDest(pThis);
+    RECT rc = CThemeThumbnail_RectSwatch(pThis);
+    
+    if (pThemeFile) {
+        BOOL res = getType(pThis, pThemeFile);
+
+        if (res == 1) {
+            // 603 = basic
+            HBITMAP bitmap = PremultiplyLoadBitmap(hThemeui, 603);
+            AlphaDrawImage(hdcDest, bitmap, rc);
+            return;
+        } else if (res == 2) {
+            // 604 = classic
+            HBITMAP bitmap = PremultiplyLoadBitmap(hThemeui, 604);
+            AlphaDrawImage(hdcDest, bitmap, rc);
+            return;
+        }
+    }
+
+    CThemeThumbnail___RenderColorSwatch_orig(pThis);
+}
+
+bool (*ATL_CComBSTR_LoadStringW_orig)(BSTR *, HINSTANCE, UINT);
+
+bool ATL_CComBSTR_LoadStringW_hook(BSTR *pstr, HINSTANCE hinst, UINT resid)
+{
+    bool result = ATL_CComBSTR_LoadStringW_orig(pstr, hinst, resid);
+    if (g_swatchType)
+    {
+        switch (g_swatchType)
+        {
+            case BasicSwatch:
+            {
+                *pstr = SysAllocString(g_basicName.get());
+                return true;
+            }
+            case ClassicSwatch:
+            {
+                *pstr = SysAllocString(g_classicName.get());
+                return true;
+            }
+        }
+    }
+    return result;
+}
+
+
+HRESULT (*CThemeCplCore__UpdateWindowColorIconAndName_orig)(void *, CThemeFile *);
+HRESULT CThemeCplCore__UpdateWindowColorIconAndName_hook(void *pThis, CThemeFile *pThemeFile)
+{
+    if (pThemeFile)
+    {
+        BOOL res = getType(pThis, pThemeFile);
+        g_swatchType = res;
+    }
+    HRESULT hr = CThemeCplCore__UpdateWindowColorIconAndName_orig(pThis, pThemeFile);
+    g_swatchType = 0;
+    return hr;
+}
+
+void LoadSettings(void)
+{
+    g_cornerRadius = Wh_GetIntSetting(L"corner_radius");
+    g_basicName = WindhawkUtils::StringSetting::make(L"basic_name");
+    g_classicName = WindhawkUtils::StringSetting::make(L"classic_name");
+}
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"Init");
+
+    LoadSettings();
+
+    HMODULE hThemeui = LoadLibraryW(L"themeui.dll");
+    if (!hThemeui)
+    {
+        Wh_Log(L"Failed to load themeui.dll");
+        return FALSE;
+    }
+
+
+    HMODULE hThemeCpl = LoadLibraryW(L"themecpl.dll");
+    if (!hThemeCpl)
+    {
+        Wh_Log(L"Failed to load themecpl.dll");
+        return FALSE;
+    }
+
+    const WindhawkUtils::SYMBOL_HOOK themeUiDllHooks[]
+    {
+        {
+            {
+                L"void __cdecl AlphaFillRegion(struct HDC__ *,unsigned long,struct HRGN__ *,struct tagRECT *)"
+            },
+            &AlphaFillRegion_orig,
+            AlphaFillRegion_hook,
+            false
+        },
+        {
+            {
+                L"private: void __cdecl CThemeThumbnail::_RenderColorSwatch(void)"
+            },
+            &CThemeThumbnail___RenderColorSwatch_orig,
+            CThemeThumbnail___RenderColorSwatch_hook,
+            false
+        },
+        {
+            {
+                L"int __cdecl AlphaDrawImage(struct HDC__ *,struct HBITMAP__ *,struct tagRECT *)"
+            },
+            &AlphaDrawImage,
+            nullptr,
+            false
+        },
+        {
+            {
+                L"struct HBITMAP__ * __cdecl PremultiplyLoadBitmap(struct HINSTANCE__ *,unsigned int)"
+            },
+            &PremultiplyLoadBitmap,
+            nullptr,
+            false
+        },
+        {
+            {
+                L"private: long __cdecl CThemeFile::_getIntSetting(unsigned short const *,unsigned short const *,int,int *)"
+            },
+            &CThemeFile__getIntSetting,
+            nullptr,
+            false
+        },
+        {
+            {
+                L"private: long __cdecl CThemeFile::_getThemeSetting(unsigned short const *,unsigned short const *,unsigned long,unsigned short * *)"
+            },
+            &CThemeFile__getThemeSetting,
+            nullptr,
+            false
+        }
+    };
+
+    const WindhawkUtils::SYMBOL_HOOK themeCplDllHooks[]
+    {
+        {
+            {
+                L"public: bool __cdecl ATL::CComBSTR::LoadStringW(struct HINSTANCE__ *,unsigned int)"
+            },
+            &ATL_CComBSTR_LoadStringW_orig,
+            ATL_CComBSTR_LoadStringW_hook,
+            false
+        },
+        {
+            {
+                L"private: long __cdecl CThemeCplCore::_UpdateWindowColorIconAndName(struct ITheme *)"
+            },
+            &CThemeCplCore__UpdateWindowColorIconAndName_orig,
+            CThemeCplCore__UpdateWindowColorIconAndName_hook,
+            false
+        }
+    };
+
+    if (!WindhawkUtils::HookSymbols(hThemeui, themeUiDllHooks,
+                                    ARRAYSIZE(themeUiDllHooks))) 
+    {
+        Wh_Log(L"Failed to hook themeui.dll");
+        return FALSE;
+    }
+
+
+    if (!WindhawkUtils::HookSymbols(hThemeCpl, themeCplDllHooks,
+                                    ARRAYSIZE(themeCplDllHooks))) 
+    {
+        Wh_Log(L"Failed to hook themecpl.dll");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+void Wh_ModSettingsChanged(void)
+{
+    LoadSettings();
+}

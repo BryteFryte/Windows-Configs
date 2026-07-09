@@ -1,0 +1,226 @@
+// ==WindhawkMod==
+// @id              w7-shell-ui-accent-overrider
+// @name            Win7 Shell UI Accent Overrider
+// @description     Override accent to dwm blur behind for shell ui
+// @version         1.3.0
+// @author          ALTaleX
+// @github          https://github.com/ALTaleX531
+// @include         explorer.exe
+// @compilerOptions -ldwmapi -lgdi32
+// ==/WindhawkMod==
+
+#include <windhawk_api.h>
+#include <wingdi.h>
+#include <winuser.h>
+#include <dwmapi.h>
+
+struct ACCENT_POLICY
+{
+    DWORD AccentState;
+    DWORD AccentFlags;
+    DWORD dwGradientColor;
+    DWORD dwAnimationId;
+};
+
+enum WINDOWCOMPOSITIONATTRIBUTE
+{
+    WCA_FORCE_ACTIVEWINDOW_APPEARANCE = 15,
+    WCA_ACCENT_POLICY = 19
+};
+
+struct WINDOWCOMPOSITIONATTRIBUTEDATA
+{
+    WINDOWCOMPOSITIONATTRIBUTE Attribute;
+    PVOID pvData;
+    SIZE_T cbData;
+};
+
+static BOOL (WINAPI *pOriginalSetWindowCompositionAttribute)(HWND, const WINDOWCOMPOSITIONATTRIBUTEDATA*) = nullptr;
+static HRESULT (WINAPI *pOriginalDwmpUpdateAccentBlurRect)(HWND, LPCRECT) = nullptr;
+
+typedef LRESULT (WINAPI *CallWindowProcW_t)(WNDPROC, HWND, UINT, WPARAM, LPARAM);
+static CallWindowProcW_t CallWindowProcW_orig = nullptr;
+
+bool IsClass(HWND hWnd, const wchar_t* target)
+{
+    wchar_t className[256];
+    return GetClassNameW(hWnd, className, 256) && wcscmp(className, target) == 0;
+}
+
+void ApplyColorizationWorkaround(HWND hWnd)
+{
+    if (GetPropW(hWnd, L"Wh_ColorizationApplied")) return;
+
+    BOOL active = TRUE;
+    WINDOWCOMPOSITIONATTRIBUTEDATA data
+    {
+        .Attribute = WCA_FORCE_ACTIVEWINDOW_APPEARANCE,
+        .pvData = &active,
+        .cbData = sizeof(active),
+    };
+    pOriginalSetWindowCompositionAttribute(hWnd, &data);
+
+    LONG_PTR style = GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hWnd, GWL_EXSTYLE, style & ~WS_EX_LAYERED);
+    SetWindowLongPtrW(hWnd, GWL_EXSTYLE, style | WS_EX_LAYERED);
+
+    SetPropW(hWnd, L"Wh_ColorizationApplied", (HANDLE)1);
+}
+
+BOOL WINAPI SetWindowCompositionAttributeHook(HWND hWnd, const WINDOWCOMPOSITIONATTRIBUTEDATA* data)
+{
+    if (data->Attribute != WCA_ACCENT_POLICY ||
+        (!IsClass(hWnd, L"Shell_TrayWnd") &&
+         !IsClass(hWnd, L"Shell_SecondaryTrayWnd") &&
+         !IsClass(hWnd, L"TaskListThumbnailWnd")))
+    {
+        return pOriginalSetWindowCompositionAttribute(hWnd, data);
+    }
+
+    auto& accentPolicy = *reinterpret_cast<ACCENT_POLICY*>(data->pvData);
+
+    if (accentPolicy.AccentState == 1)
+    {
+        DWM_BLURBEHIND blurBehind { .dwFlags = DWM_BB_ENABLE, .fEnable = FALSE };
+        DwmEnableBlurBehindWindow(hWnd, &blurBehind);
+        return pOriginalSetWindowCompositionAttribute(hWnd, data);
+    }
+
+    DWM_BLURBEHIND blurBehind
+    {
+        .dwFlags = DWM_BB_ENABLE,
+        .fEnable = (accentPolicy.AccentState != 0)
+    };
+    DwmEnableBlurBehindWindow(hWnd, &blurBehind);
+
+    ACCENT_POLICY replacedAccentPolicy{};
+    WINDOWCOMPOSITIONATTRIBUTEDATA replacedData
+    {
+        .Attribute = WCA_ACCENT_POLICY,
+        .pvData = &replacedAccentPolicy,
+        .cbData = sizeof(replacedAccentPolicy)
+    };
+    return pOriginalSetWindowCompositionAttribute(hWnd, &replacedData);
+}
+
+HRESULT WINAPI DwmpUpdateAccentBlurRectHook(HWND hWnd, LPCRECT lprc)
+{
+    if (!IsClass(hWnd, L"TaskListThumbnailWnd"))
+        return pOriginalDwmpUpdateAccentBlurRect(hWnd, lprc);
+
+    ApplyColorizationWorkaround(hWnd);
+
+    ACCENT_POLICY accentPolicy{};
+    WINDOWCOMPOSITIONATTRIBUTEDATA data
+    {
+        .Attribute = WCA_ACCENT_POLICY,
+        .pvData = &accentPolicy,
+        .cbData = sizeof(accentPolicy)
+    };
+    pOriginalSetWindowCompositionAttribute(hWnd, &data);
+
+    DWM_BLURBEHIND blurBehind
+    {
+        .dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION,
+        .fEnable = TRUE,
+        .hRgnBlur = CreateRoundRectRgn(lprc->left, lprc->top, lprc->right, lprc->bottom + 2, 4, 4)
+    };
+    HRESULT hr = DwmEnableBlurBehindWindow(hWnd, &blurBehind);
+    DeleteObject(blurBehind.hRgnBlur);
+    return hr;
+}
+
+LRESULT WINAPI CallWindowProcW_hook(WNDPROC lpPrevWndFunc, HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    if (uMsg == WM_NCACTIVATE && IsClass(hWnd, L"DV2ControlHost") && (GetWindowLongW(hWnd, GWL_STYLE) & WS_THICKFRAME))
+        return CallWindowProcW_orig(lpPrevWndFunc, hWnd, uMsg, TRUE, lParam);
+
+    return CallWindowProcW_orig(lpPrevWndFunc, hWnd, uMsg, wParam, lParam);
+}
+
+BOOL CALLBACK EnumDV2Windows(HWND hWnd, LPARAM)
+{
+    if (IsClass(hWnd, L"DV2ControlHost") && (GetWindowLongW(hWnd, GWL_STYLE) & WS_THICKFRAME))
+        SendMessageW(hWnd, WM_NCACTIVATE, TRUE, 0);
+    return TRUE;
+}
+
+DWORD WINAPI DelayedInitThread(LPVOID)
+{
+    Sleep(500);
+
+    ACCENT_POLICY accentPolicy { .AccentState = 3 };
+    WINDOWCOMPOSITIONATTRIBUTEDATA data { .Attribute = WCA_ACCENT_POLICY, .pvData = &accentPolicy, .cbData = sizeof(accentPolicy) };
+
+    const wchar_t* classes[] = { L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"TaskListThumbnailWnd" };
+    for (const auto* cls : classes) {
+        if (HWND hWnd = FindWindowW(cls, nullptr)) {
+            SetWindowCompositionAttributeHook(hWnd, &data);
+            if (wcscmp(cls, L"TaskListThumbnailWnd") == 0) ApplyColorizationWorkaround(hWnd);
+        }
+    }
+
+    EnumWindows(EnumDV2Windows, 0);
+
+    return 0;
+}
+
+BOOL Wh_ModInit()
+{
+    HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+    HMODULE hDwmapi = LoadLibraryW(L"dwmapi.dll");
+
+    if (hUser32) {
+        pOriginalSetWindowCompositionAttribute = (BOOL (WINAPI *)(HWND, const WINDOWCOMPOSITIONATTRIBUTEDATA*))GetProcAddress(hUser32, "SetWindowCompositionAttribute");
+        if (pOriginalSetWindowCompositionAttribute)
+            Wh_SetFunctionHook((void*)pOriginalSetWindowCompositionAttribute, (void*)SetWindowCompositionAttributeHook, (void**)&pOriginalSetWindowCompositionAttribute);
+
+        void* pCallWindowProc = (void*)GetProcAddress(hUser32, "CallWindowProcW");
+        if (pCallWindowProc)
+            Wh_SetFunctionHook(pCallWindowProc, (void*)CallWindowProcW_hook, (void**)&CallWindowProcW_orig);
+    }
+
+    if (hDwmapi) {
+        pOriginalDwmpUpdateAccentBlurRect = (HRESULT (WINAPI *)(HWND, LPCRECT))GetProcAddress(hDwmapi, MAKEINTRESOURCEA(159));
+        if (pOriginalDwmpUpdateAccentBlurRect)
+            Wh_SetFunctionHook((void*)pOriginalDwmpUpdateAccentBlurRect, (void*)DwmpUpdateAccentBlurRectHook, (void**)&pOriginalDwmpUpdateAccentBlurRect);
+    }
+
+    return TRUE;
+}
+
+void Wh_ModAfterInit()
+{
+    CreateThread(NULL, 0, DelayedInitThread, NULL, 0, NULL);
+}
+
+void Wh_ModUninit()
+{
+    ACCENT_POLICY accentPolicy { .AccentState = 4, .AccentFlags = 0x13, .dwGradientColor = 1 };
+    WINDOWCOMPOSITIONATTRIBUTEDATA data { .Attribute = WCA_ACCENT_POLICY, .pvData = &accentPolicy, .cbData = sizeof(accentPolicy) };
+    DWM_BLURBEHIND blurBehind { .dwFlags = DWM_BB_ENABLE };
+
+    const wchar_t* classes[] = { L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd" };
+    for (const auto* cls : classes) {
+        if (HWND hWnd = FindWindowW(cls, nullptr)) {
+            RemovePropW(hWnd, L"Wh_ColorizationApplied");
+            DwmEnableBlurBehindWindow(hWnd, &blurBehind);
+            pOriginalSetWindowCompositionAttribute(hWnd, &data);
+        }
+    }
+
+    if (HWND hWnd = FindWindowW(L"TaskListThumbnailWnd", nullptr)) {
+        RemovePropW(hWnd, L"Wh_ColorizationApplied");
+
+        blurBehind.fEnable = TRUE;
+        blurBehind.hRgnBlur = CreateRectRgn(0, 0, -1, -1);
+        DwmEnableBlurBehindWindow(hWnd, &blurBehind);
+        DeleteObject(blurBehind.hRgnBlur);
+
+        accentPolicy = { .AccentState = 3, .AccentFlags = 0x200 };
+        pOriginalSetWindowCompositionAttribute(hWnd, &data);
+
+        RECT blurRect{};
+        DwmpUpdateAccentBlurRectHook(hWnd, &blurRect);
+    }
+}

@@ -1,0 +1,128 @@
+// ==WindhawkMod==
+// @id              dwm-thick-frames
+// @name            DWM Thick Frames
+// @description     Makes all window borders with DWM thick again, like Windows 8.1 and before.
+// @version         1.0.0
+// @include         dwm.exe
+// @architecture    x86-64
+// @compilerOptions -lgdi32
+// ==/WindhawkMod==
+
+// ==WindhawkModSettings==
+/*
+- clientedge: true
+  $name: Expand for client edge
+  $description: Expand the border by two pixels on each side for windows with the WS_EX_CLIENTEDGE style.
+*/
+// ==/WindhawkModSettings==
+
+#include <windhawk_utils.h>
+#include <uxtheme.h>
+#include <windows.h>
+
+bool g_fClientEdge = false;
+
+struct CWindowData : _LIST_ENTRY
+{
+    LPWSTR pszTitle;
+    void *pIDwmWindow;
+    HSPRITE hsprite;
+    HWND hwnd;
+    RECT rcWindow;
+    MARGINS clientMargins;
+    MARGINS marFrameInset;
+    int borderThickness;
+    DWORD dwStyle;
+    DWORD dwExStyle;
+};
+
+#define CTopLevelWindow_m_pWindowData(pThis) (CWindowData *)*((ULONGLONG *)pThis + 91)
+#define CTopLevelWindow_m_clientMargins(pThis) (PMARGINS)((LPBYTE)pThis + 628)
+
+#define min(x, y) ((x) > (y)) ? (y) : (x)
+#define max(x, y) ((x) > (y)) ? (x) : (y)
+
+bool (*CTopLevelWindow_UpdateMarginsDependentOnStyle_orig)(void*);
+bool CTopLevelWindow_UpdateMarginsDependentOnStyle_hook(void* pThis) {
+    bool ret = CTopLevelWindow_UpdateMarginsDependentOnStyle_orig(pThis);
+    CWindowData *pwdData = CTopLevelWindow_m_pWindowData(pThis);
+    DWORD dwStyle = pwdData->dwStyle;
+    DWORD dwExStyle = pwdData->dwExStyle;
+
+    RECT rcStandardFrame = { 0 };
+    AdjustWindowRectEx(&rcStandardFrame, dwStyle | WS_THICKFRAME, FALSE, dwExStyle);
+
+    MARGINS marOutside;
+    int left = max(pwdData->clientMargins.cxLeftWidth, -rcStandardFrame.left);
+    marOutside.cxLeftWidth = pwdData->clientMargins.cxLeftWidth - left;
+    int right = max(pwdData->clientMargins.cxRightWidth, rcStandardFrame.right);
+    marOutside.cxRightWidth = pwdData->clientMargins.cxRightWidth - right;
+    int top = max(pwdData->clientMargins.cyTopHeight, -rcStandardFrame.top);
+    marOutside.cyTopHeight = pwdData->clientMargins.cyTopHeight - top;
+    int bottom = max(pwdData->clientMargins.cyBottomHeight, rcStandardFrame.bottom);
+    marOutside.cyBottomHeight = pwdData->clientMargins.cyBottomHeight - bottom;
+
+    if ((dwExStyle & WS_EX_CLIENTEDGE) && g_fClientEdge)
+    {
+        Wh_Log(L"h");
+        marOutside.cxLeftWidth -= 2;
+        marOutside.cxRightWidth -= 2;
+        marOutside.cyTopHeight -= 0;
+        marOutside.cyBottomHeight -= 2;
+    }
+    
+    if (pwdData->clientMargins.cxLeftWidth > 0
+    && pwdData->clientMargins.cxRightWidth > 0
+    && pwdData->clientMargins.cyTopHeight > 0
+    && pwdData->clientMargins.cyBottomHeight > 0) {
+        PMARGINS pmarClientMargins = CTopLevelWindow_m_clientMargins(pThis);
+        pmarClientMargins->cxLeftWidth = marOutside.cxLeftWidth;
+        pmarClientMargins->cxRightWidth = marOutside.cxRightWidth;
+        pmarClientMargins->cyTopHeight = marOutside.cyTopHeight;
+        pmarClientMargins->cyBottomHeight = marOutside.cyBottomHeight;
+    }
+
+    return ret;
+}
+
+WindhawkUtils::SYMBOL_HOOK uDWMDllHooks[] = {
+    {
+        {
+            L"private: bool __cdecl CTopLevelWindow::UpdateMarginsDependentOnStyle(void)"
+        },
+        &CTopLevelWindow_UpdateMarginsDependentOnStyle_orig,
+        CTopLevelWindow_UpdateMarginsDependentOnStyle_hook,
+        false
+    }
+};
+
+void UpdateSettings(void)
+{
+    g_fClientEdge = Wh_GetIntSetting(L"clientedge");
+}
+
+void Wh_ModSettingsChanged(void)
+{
+    UpdateSettings();
+}
+
+BOOL Wh_ModInit(void)
+{
+    Wh_Log(L"Init");
+    UpdateSettings();
+
+    HMODULE uDWM = LoadLibraryW(L"uDWM.dll");
+    if (!uDWM)
+    {
+        Wh_Log(L"Failed to load uDWM.dll");
+        return FALSE;
+    }
+
+    if (!WindhawkUtils::HookSymbols(uDWM, uDWMDllHooks, ARRAYSIZE(uDWMDllHooks)))
+    {
+        Wh_Log(L"Failed to hook one or more symbol functions in uDWM.dll");
+        return FALSE;
+    }
+
+    return TRUE;
+}

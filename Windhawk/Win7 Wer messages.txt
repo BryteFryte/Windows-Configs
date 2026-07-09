@@ -1,0 +1,976 @@
+// ==WindhawkMod==
+// @id              win7-style-wer-dialogs
+// @name            Windows 7 Style WER Dialogs
+// @description     Restores the Windows 7 WER crash/hang dialog behavior on Windows 10.
+// @version         1.0.0
+// @author          repensky
+// @github          https://github.com/repensky
+// @include         WerFault.exe
+// @compilerOptions -luser32 -ladvapi32 -lwininet -lcomctl32
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Windows 7 Style WER Dialogs
+Restores the Windows 7 WER (Windows Error Reporting) dialog behavior in later versions of Windows 10. Supports 64-bit and 32-bit applications.
+
+### DefaultConsent=1 (Ask before checking)
+Shows the wide dialog with:
+- "Check for a solution and close the program"
+- "Close the program"
+- "Wait for the program to respond" (for not responding)
+- "View problem details" footer
+
+### DefaultConsent values 2, 3 and 4
+Restores the "has stopped working" dialog that later versions of Windows 10 had suppressed.
+
+## Registry
+Set `DefaultConsent` (REG_DWORD) to `1`, `2`, `3` or `4` in:
+- `HKCU\SOFTWARE\Microsoft\Windows\Windows Error Reporting\Consent` (per-user setting)
+- `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\Consent` (machine setting)
+
+You can also natively adjust this setting without changing registry in `Action Center > Maintenance > Check for solutions to problem reports > Settings`. (restoration required as not present in stock Windows 10)
+
+## Compatibility
+Tested on Windows 10 IoT LTSC 21H2. Should work on different Windows versions, although not guaranteed.
+*/
+// ==/WindhawkModReadme==
+
+#include <windhawk_utils.h>
+#include <wininet.h>
+
+// ============================================================================
+// Globals and forward declarations
+// ============================================================================
+typedef int _CONSENT_SETTING;
+typedef int USER_SELECTION;
+
+static DWORD g_defaultConsent = 0;
+static int g_origReportType = 0;
+static BOOL g_werDllHooked = FALSE;
+static BOOL g_WeruiDllHooked = FALSE;
+static BOOL g_targetIsExplorer = FALSE;
+
+static void InstallWeruiDllHooks(HMODULE hMod);
+static void InstallWerDllHooks(HMODULE hMod);
+
+// ============================================================================
+// Architecture constants
+// ============================================================================
+#ifdef _WIN64
+  #define OFF_CONSENT        0xC40
+  #define OFF_REPORT_TYPE    8
+  #define OFF_UI_STATE       0xb0
+  #define OFF_SETTINGS_PTR   0x50
+  #define ORD_REPORTFLAGS    36
+  #define ORD_UIPARAM        47
+#else
+  #define OFF_CONSENT        0x930
+  #define OFF_REPORT_TYPE    4
+  #define OFF_UI_STATE       0x64
+  #define OFF_SETTINGS_PTR   0x2C
+  #define ORD_REPORTFLAGS    36
+  #define ORD_UIPARAM        47
+#endif
+
+// ============================================================================
+// Pattern scanner
+// ============================================================================
+static void* PatternScan(HMODULE hModule, const BYTE* pattern,
+                          const char* mask, size_t len) {
+    BYTE* base = (BYTE*)hModule;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        BYTE* start = base + sec->VirtualAddress;
+        DWORD size = sec->Misc.VirtualSize;
+        for (DWORD j = 0; j + len <= size; j++) {
+            bool ok = true;
+            for (size_t k = 0; k < len && ok; k++)
+                if (mask[k] == 'x' && start[j + k] != pattern[k]) ok = false;
+            if (ok) return start + j;
+        }
+    }
+    return nullptr;
+}
+
+static void* Resolve(HMODULE hMod, const BYTE* pat, const char* mask,
+                      size_t len, DWORD rva) {
+    void* addr = PatternScan(hMod, pat, mask, len);
+    if (!addr && rva) addr = (BYTE*)hMod + rva;
+    return addr;
+}
+
+// ============================================================================
+// Byte patterns
+// ============================================================================
+#ifdef _WIN64
+
+static const BYTE kComputeConsent[] = {
+    0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,
+    0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x83,0xEC,0x20,0x4C,0x8B,0xF9,0x4C,
+    0x8B,0xF2,0x48,0x81};
+static const char kComputeConsentM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_ComputeConsent = 0x233CC };
+
+static const BYTE kHeadless[] = {
+    0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x41,0x08,0x48,0x8B,
+    0xD9,0x8B,0xB8,0xF0,0x0D,0x00,0x00};
+static const char kHeadlessM[] = "xxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_Headless = 0x10768 };
+
+static const BYTE kGetInitDlg[] = {
+    0x48,0x8B,0xC4,0x48,0x89,0x58,0x18,0x48,0x89,0x68,0x20,0x56,0x57,0x41,0x55,0x48,
+    0x83,0xEC,0x50,0x83,0x60,0x10,0x00,0x48};
+static const char kGetInitDlgM[] = "xxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_GetInitDlg = 0x4110 };
+
+static const BYTE kOnCreated[] = {
+    0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x55,0x57,0x41,0x56,0x48,0x8B,
+    0xEC,0x48,0x83,0xEC,0x60,0x83,0x65,0x30,0x00,0x0F,0x57,0xC0,0x48,0x8B,0xF9,0x48,
+    0x8B,0xF2,0x48,0x8B};
+static const char kOnCreatedM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_OnCreated = 0x8F5C };
+
+static const BYTE kOnInitProg[] = {
+    0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x48,0x89,0x7C,0x24,0x18,0x55,
+    0x41,0x56,0x41,0x57,0x48,0x8B,0xEC,0x48,0x83,0xEC,0x60,0x83,0x65,0x38,0x00,0x0F,
+    0x57,0xC0,0x48,0x8B,0xF9,0x45,0x8B,0xF8};
+static const char kOnInitProgM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_OnInitProg = 0x5594 };
+
+static const BYTE kUIStateRestarting[] = {
+    0x48,0x8B,0xC4,0x55,0x48,0x8B,0xEC,0x48,0x81,0xEC,0x80,0x00,0x00,0x00,0x48,0xC7,
+    0x45,0xC0,0xFE,0xFF,0xFF,0xFF,0x48,0x89,0x58,0x08,0x48,0x8B,0xD9,0x48,0x83,0x65,
+    0xE8,0x00};
+static const char kUIStateRestartingM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_UIStateRestarting = 0x620C };
+
+static const BYTE kUIStateClosing[] = {
+    0x48,0x8B,0xC4,0x55,0x56,0x57,0x41,0x56,0x41,0x57,0x48,0x8D,0x68,0xA1,0x48,0x81,
+    0xEC,0xB0,0x00,0x00,0x00,0x48,0xC7,0x45,0xC7,0xFE,0xFF,0xFF,0xFF,0x48,0x89,0x58,
+    0x18,0x48,0x8B,0xF9};
+static const char kUIStateClosingM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_UIStateClosing = 0x63EC };
+
+#else // x86
+
+static const BYTE kComputeConsent[] = {
+    0x8B,0xFF,0x55,0x8B,0xEC,0x83,0xEC,0x10,0x53,0x56,0x57,0x8B,0xF9,0x33,0xF6,0x89,
+    0x7D,0xFC,0x46,0x8D,0x8F,0x90,0x00,0x00,0x00,0xE8};
+static const char kComputeConsentM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_ComputeConsent = 0x8BA13 };
+
+static const BYTE kHeadless[] = {
+    0x8B,0xFF,0x51,0x56,0x8B,0xF1,0x57,0x8B,0x46,0x04,0x8B,0xB8,0x6C,0x0A,0x00,0x00,
+    0xF7,0xC7,0x04,0x00,0x18,0x80,0x75,0x3A,0x83,0x7E,0x70,0x00,0x74,0x34,0x8B,0x4E,
+    0x2C,0x8D,0x89,0x20,0x01,0x00,0x00,0xE8};
+static const char kHeadlessM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_Headless = 0x466E2 };
+
+static const BYTE kGetInitDlg[] = {
+    0x8B,0xFF,0x55,0x8B,0xEC,0x83,0xE4,0xF8,0x83,0xEC,0x0C,0x53,0x56,0x57,0x6A,0x02,
+    0x33,0xC0,0x8B,0xF1,0x5F,0x50,0x50,0x89,0x44,0x24,0x1C,0x89,0x44,0x24,0x18};
+static const char kGetInitDlgM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_GetInitDlg = 0x6649 };
+
+static const BYTE kOnCreated[] = {
+    0x8B,0xFF,0x55,0x8B,0xEC,0x83,0xE4,0xF8,0x83,0xEC,0x24,0x83,0x64,0x24,0x04,0x00,
+    0x33,0xC0,0x53,0x56,0x8B,0x75,0x08,0x8B,0xD9,0x57,0x8D,0x7C,0x24,0x1C,0xAB,0x56,
+    0xAB,0xAB,0xAB,0xAB};
+static const char kOnCreatedM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_OnCreated = 0x9EEC };
+
+static const BYTE kOnInitProg[] = {
+    0x8B,0xFF,0x55,0x8B,0xEC,0x83,0xEC,0x1C,0x53,0x83,0x65,0xFC,0x00,0x33,0xC0,0x56,
+    0x57,0x8D,0x7D,0xE4,0x8B,0xD9,0xAB,0xAB,0xAB,0xAB,0xAB,0x8B,0x7D,0x08,0x57};
+static const char kOnInitProgM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_OnInitProg = 0x74C9 };
+
+static const BYTE kGetInitUIState[] = {
+    0x8B,0xFF,0x53,0x56,0x57,0x8B,0xF9,0x8B,0x4F,0x04,0x83,0xB9,0xF0,0x08,0x00,0x00,
+    0x03,0x8B,0xB1,0x9C,0x7E,0x00,0x00,0x8B,0xB9,0x6C,0x0A,0x00,0x00,0x74};
+static const char kGetInitUIStateM[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+enum { RVA_GetInitUIState = 0x4314B };
+
+#endif
+
+// ============================================================================
+// MUI string resources
+// ============================================================================
+static wchar_t g_hangBtnOn[256], g_hangBtnOff[256];
+static wchar_t g_hangCtOn[512], g_hangCtOff[512];
+static wchar_t g_crashBtnOn[4][256], g_crashBtnOff[4][256];
+static wchar_t g_crashCtOn[4][512], g_crashCtOff[4][512];
+// Explorer hang restart variants
+static wchar_t g_hangRestartBtnOn[256];
+static wchar_t g_hangRestartBtnOff[256];
+static wchar_t g_hangRestartCtOn[512];
+static wchar_t g_hangRestartCtOff[512];
+
+static BOOL IsOnline() {
+    DWORD f = 0;
+    return InternetGetConnectedState(&f, 0);
+}
+
+// ============================================================================
+// Hook: CSettings::ComputeConsent
+// ============================================================================
+typedef _CONSENT_SETTING (__thiscall *ComputeConsent_t)(void*, int*);
+ComputeConsent_t ComputeConsent_orig;
+
+_CONSENT_SETTING __thiscall ComputeConsent_hook(void* pThis, int* p1) {
+    if (*(int*)((char*)pThis + OFF_CONSENT) == 1) { *p1 = 0; return 1; }
+    return ComputeConsent_orig(pThis, p1);
+}
+
+// ============================================================================
+// Hook: WerpGetReportFlags
+// ============================================================================
+typedef long (WINAPI *WerpGetReportFlags_t)(void*, unsigned long*);
+WerpGetReportFlags_t WerpGetReportFlags_orig;
+
+long WINAPI WerpGetReportFlags_hook(void* p1, unsigned long* p2) {
+    long r = WerpGetReportFlags_orig(p1, p2);
+    if (r >= 0 && p2 && g_targetIsExplorer)
+        *p2 = (*p2 & ~3UL) | 2;
+    return r;
+}
+
+// ============================================================================
+// Hook: WerpGetUIParamByIndex
+// ============================================================================
+typedef long (WINAPI *WerpGetUIParamByIndex_t)(void*, int, unsigned short**);
+WerpGetUIParamByIndex_t WerpGetUIParamByIndex_orig;
+
+long WINAPI WerpGetUIParamByIndex_hook(void* p1, int idx, unsigned short** pp) {
+    long r = WerpGetUIParamByIndex_orig(p1, idx, pp);
+    if (g_defaultConsent != 1 || !pp) return r;
+
+    BOOL online = IsOnline();
+    wchar_t* text = nullptr;
+
+    if (idx == 5 || idx == 6) {
+        if (g_origReportType == 2) {
+            unsigned long fl = 0;
+            WerpGetReportFlags_hook(p1, &fl);
+            text = online ? g_crashBtnOn[fl & 3] : g_crashBtnOff[fl & 3];
+        } else if (idx == 5 || idx == 6) {
+            if (g_targetIsExplorer && g_hangRestartBtnOn[0])
+                text = online ? g_hangRestartBtnOn : g_hangRestartBtnOff;
+            else
+                text = online ? g_hangBtnOn : g_hangBtnOff;
+        }
+    } else if (idx == 4) {
+        if (g_origReportType == 2) {
+            unsigned long fl = 0;
+            WerpGetReportFlags_hook(p1, &fl);
+            text = online ? g_crashCtOn[fl & 3] : g_crashCtOff[fl & 3];
+        } else {
+            if (g_targetIsExplorer && g_hangRestartCtOn[0])
+                text = online ? g_hangRestartCtOn : g_hangRestartCtOff;
+            else
+                text = online ? g_hangCtOn : g_hangCtOff;
+        }
+    }
+
+    if (text && text[0]) { *pp = (unsigned short*)text; return 0; }
+    return r;
+}
+
+// ============================================================================
+// Hook: GetInitialDialogSelection
+// ============================================================================
+typedef USER_SELECTION (__thiscall *GetInitDlg_t)(void*);
+GetInitDlg_t GetInitDlg_orig;
+
+USER_SELECTION __thiscall GetInitDlg_hook(void* pThis) {
+    int* pType = (int*)((char*)pThis + OFF_REPORT_TYPE);
+    int* pState = (int*)((char*)pThis + OFF_UI_STATE);
+    int origType = *pType;
+    g_origReportType = origType;
+
+    if (g_defaultConsent == 1) {
+        if (origType == 2 || origType == 4) *pType = 3;
+        if (*pState != 0) *pState = 0;
+    }
+
+    USER_SELECTION result = GetInitDlg_orig(pThis);
+    *pType = origType;
+    return result;
+}
+
+// ============================================================================
+// Hook: CalcDefaultSecondLevelPromptResult
+// ============================================================================
+typedef int (__thiscall *CalcSecondLevel_t)(void*);
+CalcSecondLevel_t CalcSecondLevel_orig;
+
+int __thiscall CalcSecondLevel_hook(void* pThis) {
+#ifdef _WIN64
+    LONGLONG sp = *(LONGLONG*)((char*)pThis + OFF_SETTINGS_PTR);
+#else
+    int sp = *(int*)((char*)pThis + OFF_SETTINGS_PTR);
+#endif
+    if (sp && *(int*)(sp + OFF_CONSENT) == 1) return 0;
+    return CalcSecondLevel_orig(pThis);
+}
+
+// ============================================================================
+// Hook: GetInitialUIState
+// Without this, CWeruiFacade::Initialize fails for instant crashes because GetInitialUIState returns 0.
+// ============================================================================
+typedef int (__thiscall *GetInitialUIState_t)(void*);
+GetInitialUIState_t GetInitialUIState_orig;
+
+int __thiscall GetInitialUIState_hook(void* pThis) {
+    int r = GetInitialUIState_orig(pThis);
+    if (r == 0 && g_defaultConsent == 1) r = 1;
+    return r;
+}
+
+// ============================================================================
+// Hook: ShouldUseHeadLessUIMode
+// ============================================================================
+typedef int (__thiscall *Headless_t)(void*);
+Headless_t Headless_orig;
+
+int __thiscall Headless_hook(void* pThis) {
+    int r = Headless_orig(pThis);
+    if (r != 0) {
+        LPWSTR cmd = GetCommandLineW();
+        LPCWSTR pf = cmd ? wcsstr(cmd, L"-p ") : NULL;
+        if (!pf) pf = cmd ? wcsstr(cmd, L"/p ") : NULL;
+        if (pf) {
+            DWORD pid = (DWORD)_wtoi(pf + 3);
+            wchar_t path[MAX_PATH], file[MAX_PATH];
+            GetTempPathW(MAX_PATH, path);
+            wsprintfW(file, L"%sWerConsentUI_%d.tmp", path, pid);
+            HANDLE hf = CreateFileW(file, GENERIC_WRITE, 0, NULL,
+                                    CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL);
+            if (hf != INVALID_HANDLE_VALUE) { CloseHandle(hf); r = 0; }
+            else DeleteFileW(file);
+        }
+    }
+
+    // When forcing UI, ensure werui.dll is loaded and hooked
+    if (r == 0 && !g_WeruiDllHooked) {
+        HMODULE h = GetModuleHandleW(L"werui.dll");
+        if (!h) h = LoadLibraryW(L"werui.dll");
+        if (h) { InstallWeruiDllHooks(h); Wh_ApplyHookOperations(); }
+    }
+
+    if (r == 0) {
+#ifdef _WIN64
+        int* pSettings = *(int**)((char*)pThis + OFF_SETTINGS_PTR);
+        if (pSettings) *(int*)((char*)pSettings + 0x750) = 0;
+#else
+        int* pSettings = *(int**)((char*)pThis + OFF_SETTINGS_PTR);
+        if (pSettings) *(int*)((char*)pSettings + 0x420) = 0;
+#endif
+    }
+
+    return r;
+}
+
+// ============================================================================
+// Crash/hang dialog repositioning
+// ============================================================================
+struct FindWndData { DWORD pid; HWND hwnd; };
+
+static BOOL CALLBACK FindMainWnd(HWND hwnd, LPARAM lp) {
+    FindWndData* d = (FindWndData*)lp;
+    DWORD p = 0;
+    GetWindowThreadProcessId(hwnd, &p);
+    if (p == d->pid && IsWindowVisible(hwnd) && !GetWindow(hwnd, GW_OWNER))
+        { d->hwnd = hwnd; return FALSE; }
+    return TRUE;
+}
+
+static void RepositionOverTarget(HWND hDlg) {
+    if (!hDlg || !IsWindow(hDlg)) return;
+
+    LPWSTR cmd = GetCommandLineW();
+    if (!cmd) return;
+    if (!wcsstr(cmd, L"-u ") && !wcsstr(cmd, L"/u ") &&
+        !wcsstr(cmd, L"-h ") && !wcsstr(cmd, L"/h ")) return;
+
+    LPCWSTR pf = wcsstr(cmd, L"-p ");
+    if (!pf) pf = wcsstr(cmd, L"/p ");
+    if (!pf) return;
+
+    DWORD pid = (DWORD)_wtoi(pf + 3);
+    if (!pid) return;
+
+    FindWndData d = { pid, NULL };
+    EnumWindows(FindMainWnd, (LPARAM)&d);
+    if (!d.hwnd) return;
+
+    RECT tr, dr;
+    if (!GetWindowRect(d.hwnd, &tr) || !GetWindowRect(hDlg, &dr)) return;
+
+    int dw = dr.right - dr.left, dh = dr.bottom - dr.top;
+    int tbH = GetSystemMetrics(SM_CYCAPTION) + GetSystemMetrics(SM_CYFRAME);
+    int fW = GetSystemMetrics(SM_CXFRAME);
+    int cL = tr.left + fW, cT = tr.top + tbH;
+    int cW = (tr.right - fW) - cL;
+    int cH = (tr.bottom - GetSystemMetrics(SM_CYFRAME)) - cT;
+
+    int x, y;
+    if (cH < dh + 20 || cW < dw + 20) {
+        x = tr.left + ((tr.right - tr.left) - dw) / 2;
+        y = cT + 19;
+    } else {
+        x = cL + (cW - dw) / 2;
+        y = cT + (cH - dh) / 2;
+    }
+
+    HMONITOR hm = MonitorFromRect(&tr, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(hm, &mi)) {
+        RECT w = mi.rcWork;
+        if (x < w.left) x = w.left;
+        if (y < w.top) y = w.top;
+        if (x + dw > w.right) x = w.right - dw;
+        if (y + dh > w.bottom) y = w.bottom - dh;
+    }
+
+    MoveWindow(hDlg, x, y, dw, dh, TRUE);
+    SetWindowPos(hDlg, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+}
+
+// ============================================================================
+// UpdateUIForStateRestarting function pointer
+// ============================================================================
+typedef long (__thiscall *UpdateUIForStateRestarting_t)(void*);
+UpdateUIForStateRestarting_t UpdateUIForStateRestarting_func = nullptr;
+
+static DWORD WINAPI RestartAutoCloseThread(LPVOID lpParam) {
+    Sleep(2000);
+    HANDLE* params = (HANDLE*)lpParam;
+    HANDLE hEvent = params[0];
+    delete[] params;
+    if (hEvent) SetEvent(hEvent);
+    Sleep(500);
+    ExitProcess(0);
+    return 0;
+}
+
+// ============================================================================
+// Hook: UpdateUIForStateClosing
+// ============================================================================
+typedef long (__thiscall *UpdateUIForStateClosing_t)(void*);
+UpdateUIForStateClosing_t UpdateUIForStateClosing_orig = nullptr;
+
+static BOOL g_progDialogShown = FALSE;
+
+long __thiscall UpdateUIForStateClosing_hook(void* pThis) {
+    if (g_targetIsExplorer && UpdateUIForStateRestarting_func && g_progDialogShown) {
+        UpdateUIForStateRestarting_func(pThis);
+        HANDLE* params = new HANDLE[1];
+#ifdef _WIN64
+        params[0] = *(HANDLE*)((char*)pThis + 0xC0);
+#else
+        params[0] = *(HANDLE*)((char*)pThis + 0x88);
+#endif
+        HANDLE hThread = CreateThread(NULL, 0, RestartAutoCloseThread, params, 0, NULL);
+        if (hThread) CloseHandle(hThread);
+        return 0;
+    }
+    return UpdateUIForStateClosing_orig(pThis);
+}
+
+// ============================================================================
+// Hook: OnCreated
+// ============================================================================
+typedef long (__thiscall *OnCreated_t)(void*, HWND);
+OnCreated_t OnCreated_orig;
+
+long __thiscall OnCreated_hook(void* pThis, HWND hDlg) {
+    long r = OnCreated_orig(pThis, hDlg);
+    RepositionOverTarget(hDlg);
+    return r;
+}
+
+// ============================================================================
+// Hook: OnInitProgressDialog
+// ============================================================================
+typedef long (__thiscall *OnInitProg_t)(void*, HWND, int);
+OnInitProg_t OnInitProg_orig;
+
+static LRESULT CALLBACK RestartSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                             UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    if (msg == 0x465 && g_targetIsExplorer && UpdateUIForStateRestarting_func && dwRefData) {
+        void* pThis = (void*)dwRefData;
+        RemoveWindowSubclass(hwnd, RestartSubclassProc, uIdSubclass);
+        UpdateUIForStateRestarting_func(pThis);
+        HANDLE* params = new HANDLE[1];
+#ifdef _WIN64
+        params[0] = *(HANDLE*)((char*)pThis + 0xC0);
+#else
+        params[0] = *(HANDLE*)((char*)pThis + 0x88);
+#endif
+        HANDLE hThread = CreateThread(NULL, 0, RestartAutoCloseThread, params, 0, NULL);
+        if (hThread) CloseHandle(hThread);
+        return 0;
+    }
+    if (msg == 0x401 && g_targetIsExplorer && UpdateUIForStateClosing_orig && dwRefData) {
+        void* pThis = (void*)dwRefData;
+        RemoveWindowSubclass(hwnd, RestartSubclassProc, uIdSubclass);
+        g_progDialogShown = TRUE;
+        UpdateUIForStateClosing_hook(pThis);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+long __thiscall OnInitProg_hook(void* pThis, HWND hDlg, int p2) {
+    long r = OnInitProg_orig(pThis, hDlg, p2);
+    RepositionOverTarget(hDlg);
+    g_progDialogShown = TRUE;
+
+    // For explorer: subclass the dialog
+    if ((p2 == 0 || p2 == 1) && g_targetIsExplorer && UpdateUIForStateRestarting_func && hDlg) {
+        SetWindowSubclass(hDlg, RestartSubclassProc, 0xAE01, (DWORD_PTR)pThis);
+    }
+
+    return r;
+}
+
+// ============================================================================
+// DLL hook installation functions
+// ============================================================================
+static void InstallWeruiDllHooks(HMODULE h) {
+    if (g_WeruiDllHooked) return;
+    g_WeruiDllHooked = TRUE;
+
+    WindhawkUtils::SYMBOL_HOOK syms[] = {
+        {
+#ifdef _WIN64
+            {L"?OnCreated@CInitialConsentUI@@AEAAJPEAUHWND__@@@Z"},
+#else
+            {L"?OnCreated@CInitialConsentUI@@AAEJPAUHWND__@@@Z"},
+#endif
+            &OnCreated_orig, OnCreated_hook, true
+        },
+        {
+#ifdef _WIN64
+            {L"?OnInitProgressDialog@CEventUI@@AEAAJPEAUHWND__@@H@Z"},
+#else
+            {L"?OnInitProgressDialog@CEventUI@@AAEJPAUHWND__@@H@Z"},
+#endif
+            &OnInitProg_orig, OnInitProg_hook, true
+        },
+        {
+#ifdef _WIN64
+            {L"?GetInitialDialogSelection@CEventUI@@AEAA?AW4USER_SELECTION@@XZ"},
+#else
+            {L"?GetInitialDialogSelection@CEventUI@@AAEG?AW4USER_SELECTION@@XZ"},
+#endif
+            &GetInitDlg_orig, GetInitDlg_hook, true
+        },
+        {
+#ifdef _WIN64
+            {L"?UpdateUIForStateRestarting@CEventUI@@AEAAJXZ"},
+#else
+            {L"?UpdateUIForStateRestarting@CEventUI@@AAEJXZ"},
+#endif
+            (void**)&UpdateUIForStateRestarting_func, nullptr, true
+        },
+        {
+#ifdef _WIN64
+            {L"?UpdateUIForStateClosing@CEventUI@@AEAAJXZ"},
+#else
+            {L"?UpdateUIForStateClosing@CEventUI@@AAEJXZ"},
+#endif
+            &UpdateUIForStateClosing_orig, UpdateUIForStateClosing_hook, true
+        }
+    };
+    WindhawkUtils::HookSymbols(h, syms, ARRAYSIZE(syms));
+
+    // Pattern scan mechanisms
+    if (!OnCreated_orig) {
+        void* a = Resolve(h, kOnCreated, kOnCreatedM, sizeof(kOnCreated), RVA_OnCreated);
+        if (a) Wh_SetFunctionHook(a, (void*)OnCreated_hook, (void**)&OnCreated_orig);
+    }
+    if (!OnInitProg_orig) {
+        void* a = Resolve(h, kOnInitProg, kOnInitProgM, sizeof(kOnInitProg), RVA_OnInitProg);
+        if (a) Wh_SetFunctionHook(a, (void*)OnInitProg_hook, (void**)&OnInitProg_orig);
+    }
+    if (g_defaultConsent == 1 && !GetInitDlg_orig) {
+        void* a = Resolve(h, kGetInitDlg, kGetInitDlgM, sizeof(kGetInitDlg), RVA_GetInitDlg);
+        if (a) Wh_SetFunctionHook(a, (void*)GetInitDlg_hook, (void**)&GetInitDlg_orig);
+    }
+#ifdef _WIN64
+    if (!UpdateUIForStateRestarting_func) {
+        UpdateUIForStateRestarting_func = (UpdateUIForStateRestarting_t)
+            Resolve(h, kUIStateRestarting, kUIStateRestartingM,
+                    sizeof(kUIStateRestarting), RVA_UIStateRestarting);
+    }
+    if (!UpdateUIForStateClosing_orig) {
+        void* a = Resolve(h, kUIStateClosing, kUIStateClosingM,
+                          sizeof(kUIStateClosing), RVA_UIStateClosing);
+        if (a) Wh_SetFunctionHook(a, (void*)UpdateUIForStateClosing_hook,
+                                  (void**)&UpdateUIForStateClosing_orig);
+    }
+#endif
+}
+
+static void InstallWerDllHooks(HMODULE h) {
+    if (g_werDllHooked) return;
+    g_werDllHooked = TRUE;
+
+    if (g_defaultConsent == 1) {
+        WindhawkUtils::SYMBOL_HOOK syms[] = {
+            {
+#ifdef _WIN64
+                {L"?ComputeConsent@CSettings@@AEBA?AW4_CONSENT_SETTING@@PEAH@Z"},
+#else
+                {L"?ComputeConsent@CSettings@@ABEG?AW4_CONSENT_SETTING@@PAH@Z"},
+#endif
+                &ComputeConsent_orig, ComputeConsent_hook, true
+            },
+            {
+#ifdef _WIN64
+                {L"?CalcDefaultSecondLevelPromptResult@CReportManager@@AEAAHXZ"},
+#else
+                {L"?CalcDefaultSecondLevelPromptResult@CReportManager@@AAEHXZ"},
+#endif
+                &CalcSecondLevel_orig, CalcSecondLevel_hook, true
+            },
+            {
+#ifdef _WIN64
+                {L"?ShouldUseHeadLessUIMode@CReportManager@@AEAAHXZ"},
+#else
+                {L"?ShouldUseHeadLessUIMode@CReportManager@@AAEHXZ"},
+#endif
+                &Headless_orig, Headless_hook, true
+            },
+            {
+#ifdef _WIN64
+                {L"?GetInitialUIState@CReportManager@@AEAA?AW4EVENTUI_STATE@@XZ"},
+#else
+                {L"?GetInitialUIState@CReportManager@@AAE?AW4EVENTUI_STATE@@XZ"},
+#endif
+                &GetInitialUIState_orig, GetInitialUIState_hook, true
+            }
+        };
+        WindhawkUtils::HookSymbols(h, syms, ARRAYSIZE(syms));
+
+        if (!ComputeConsent_orig) {
+            void* a = Resolve(h, kComputeConsent, kComputeConsentM,
+                              sizeof(kComputeConsent), RVA_ComputeConsent);
+            if (a) Wh_SetFunctionHook(a, (void*)ComputeConsent_hook,
+                                      (void**)&ComputeConsent_orig);
+        }
+    } else {
+        // Consent 2-4: headless override + UI state fix
+        WindhawkUtils::SYMBOL_HOOK syms[] = {
+            {
+#ifdef _WIN64
+                {L"?ShouldUseHeadLessUIMode@CReportManager@@AEAAHXZ"},
+#else
+                {L"?ShouldUseHeadLessUIMode@CReportManager@@AAEHXZ"},
+#endif
+                &Headless_orig, Headless_hook, true
+            },
+            {
+#ifdef _WIN64
+                {L"?GetInitialUIState@CReportManager@@AEAA?AW4EVENTUI_STATE@@XZ"},
+#else
+                {L"?GetInitialUIState@CReportManager@@AAE?AW4EVENTUI_STATE@@XZ"},
+#endif
+                &GetInitialUIState_orig, GetInitialUIState_hook, true
+            }
+        };
+        WindhawkUtils::HookSymbols(h, syms, ARRAYSIZE(syms));
+    }
+
+    if (!Headless_orig) {
+        void* a = Resolve(h, kHeadless, kHeadlessM,
+                          sizeof(kHeadless), RVA_Headless);
+        if (a) Wh_SetFunctionHook(a, (void*)Headless_hook,
+                                  (void**)&Headless_orig);
+    }
+#ifndef _WIN64
+    if (!GetInitialUIState_orig) {
+        void* a = Resolve(h, kGetInitUIState, kGetInitUIStateM,
+                          sizeof(kGetInitUIState), RVA_GetInitUIState);
+        if (a) Wh_SetFunctionHook(a, (void*)GetInitialUIState_hook,
+                                  (void**)&GetInitialUIState_orig);
+    }
+#endif
+
+    // Ordinal-based hooks
+    void* pF = (void*)GetProcAddress(h, MAKEINTRESOURCEA(ORD_REPORTFLAGS));
+    void* pU = (void*)GetProcAddress(h, MAKEINTRESOURCEA(ORD_UIPARAM));
+    if (pF) Wh_SetFunctionHook(pF, (void*)WerpGetReportFlags_hook,
+                                (void**)&WerpGetReportFlags_orig);
+    if (pU) Wh_SetFunctionHook(pU, (void*)WerpGetUIParamByIndex_hook,
+                                (void**)&WerpGetUIParamByIndex_orig);
+}
+
+// ============================================================================
+// DLL loading hooks (LoadLibrary + LdrLoadDll)
+// ============================================================================
+typedef HMODULE (WINAPI *LoadLibraryExW_t)(LPCWSTR, HANDLE, DWORD);
+LoadLibraryExW_t LoadLibraryExW_orig;
+typedef HMODULE (WINAPI *LoadLibraryW_t)(LPCWSTR);
+LoadLibraryW_t LoadLibraryW_orig;
+
+typedef struct _MY_UNICODE_STRING {
+    USHORT Length; USHORT MaximumLength; PWSTR Buffer;
+} MY_UNICODE_STRING;
+typedef LONG (__stdcall *LdrLoadDll_t)(PWSTR, ULONG*, MY_UNICODE_STRING*, HMODULE*);
+LdrLoadDll_t LdrLoadDll_orig;
+
+static void OnDllLoaded(HMODULE hMod, LPCWSTR name) {
+    if (!hMod || !name) return;
+    LPCWSTR fn = wcsrchr(name, L'\\');
+    fn = fn ? fn + 1 : name;
+
+    if (!g_werDllHooked && _wcsicmp(fn, L"wer.dll") == 0) {
+        InstallWerDllHooks(hMod);
+        Wh_ApplyHookOperations();
+    } else if (!g_WeruiDllHooked && _wcsicmp(fn, L"werui.dll") == 0) {
+        InstallWeruiDllHooks(hMod);
+        Wh_ApplyHookOperations();
+    }
+}
+
+HMODULE WINAPI LoadLibraryExW_hook(LPCWSTR n, HANDLE h, DWORD f) {
+    HMODULE m = LoadLibraryExW_orig(n, h, f);
+    if (!(f & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)))
+        OnDllLoaded(m, n);
+    return m;
+}
+HMODULE WINAPI LoadLibraryW_hook(LPCWSTR n) {
+    HMODULE m = LoadLibraryW_orig(n);
+    OnDllLoaded(m, n);
+    return m;
+}
+
+LONG __stdcall LdrLoadDll_hook(PWSTR sp, ULONG* dc, MY_UNICODE_STRING* dn, HMODULE* ba) {
+    LONG s = LdrLoadDll_orig(sp, dc, dn, ba);
+    if (s == 0 && ba && *ba && dn && dn->Buffer) {
+        LPCWSTR fn = wcsrchr(dn->Buffer, L'\\');
+        fn = fn ? fn + 1 : dn->Buffer;
+        if (!g_WeruiDllHooked && _wcsnicmp(fn, L"werui", 5) == 0) {
+            InstallWeruiDllHooks(*ba);
+            Wh_ApplyHookOperations();
+        } else if (!g_werDllHooked && _wcsnicmp(fn, L"wer.", 4) == 0) {
+            InstallWerDllHooks(*ba);
+            Wh_ApplyHookOperations();
+        }
+    }
+    return s;
+}
+
+#ifndef _WIN64
+typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR);
+LoadLibraryA_t LoadLibraryA_orig;
+typedef HMODULE (WINAPI *LoadLibraryExA_t)(LPCSTR, HANDLE, DWORD);
+LoadLibraryExA_t LoadLibraryExA_orig;
+
+static void OnDllLoadedA(HMODULE m, LPCSTR n) {
+    if (!m || !n) return;
+    const char* fn = strrchr(n, '\\');
+    fn = fn ? fn + 1 : n;
+    if (!g_werDllHooked && _stricmp(fn, "wer.dll") == 0) {
+        InstallWerDllHooks(m); Wh_ApplyHookOperations();
+    } else if (!g_WeruiDllHooked && _stricmp(fn, "werui.dll") == 0) {
+        InstallWeruiDllHooks(m); Wh_ApplyHookOperations();
+    }
+}
+
+HMODULE WINAPI LoadLibraryA_hook(LPCSTR n) {
+    HMODULE m = LoadLibraryA_orig(n); OnDllLoadedA(m, n); return m;
+}
+HMODULE WINAPI LoadLibraryExA_hook(LPCSTR n, HANDLE h, DWORD f) {
+    HMODULE m = LoadLibraryExA_orig(n, h, f);
+    if (!(f & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)))
+        OnDllLoadedA(m, n);
+    return m;
+}
+#endif
+
+// ============================================================================
+// Mod lifecycle
+// ============================================================================
+static void LoadMuiStrings() {
+    HMODULE h = NULL;
+
+#ifdef _WIN64
+    // 64-bit
+    h = LoadLibraryExW(L"werui.dll", NULL, LOAD_LIBRARY_AS_DATAFILE);
+#else
+    // 32-bit
+    {
+        wchar_t locale[16], muiPath[MAX_PATH];
+        GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_SNAME, locale, 16);
+        wsprintfW(muiPath, L"C:\\Windows\\Sysnative\\%s\\werui.dll.mui", locale);
+        h = LoadLibraryExW(muiPath, NULL, LOAD_LIBRARY_AS_DATAFILE);
+        if (!h) {
+            h = LoadLibraryExW(L"C:\\Windows\\Sysnative\\en-US\\werui.dll.mui",
+                               NULL, LOAD_LIBRARY_AS_DATAFILE);
+        }
+        // Fallback
+        if (!h) {
+            h = LoadLibraryExW(L"werui.dll", NULL, LOAD_LIBRARY_AS_DATAFILE);
+        }
+    }
+#endif
+
+    if (!h) return;
+    // Hang dialog strings
+    LoadStringW(h, 0xFDB, g_hangBtnOn, 256);
+    LoadStringW(h, 0xFC0, g_hangBtnOff, 256);
+    LoadStringW(h, 0xFBD, g_hangCtOn, 512);
+    LoadStringW(h, 0xFBE, g_hangCtOff, 512);
+    // Crash dialog button text
+    LoadStringW(h, 0xEE,  g_crashBtnOn[0], 256);
+    LoadStringW(h, 0x101, g_crashBtnOn[1], 256);
+    LoadStringW(h, 0x102, g_crashBtnOn[2], 256);
+    LoadStringW(h, 0x103, g_crashBtnOn[3], 256);
+    LoadStringW(h, 0xEF,  g_crashBtnOff[0], 256);
+    LoadStringW(h, 0x104, g_crashBtnOff[1], 256);
+    LoadStringW(h, 0x105, g_crashBtnOff[2], 256);
+    LoadStringW(h, 0x106, g_crashBtnOff[3], 256);
+    // Crash dialog content text
+    LoadStringW(h, 0xF9, g_crashCtOn[0], 512);
+    LoadStringW(h, 0xFA, g_crashCtOn[1], 512);
+    LoadStringW(h, 0xFB, g_crashCtOn[2], 512);
+    LoadStringW(h, 0xFC, g_crashCtOn[3], 512);
+    LoadStringW(h, 0xFD, g_crashCtOff[0], 512);
+    LoadStringW(h, 0xFE, g_crashCtOff[1], 512);
+    LoadStringW(h, 0xFF, g_crashCtOff[2], 512);
+    LoadStringW(h, 0x100, g_crashCtOff[3], 512);
+    // Explorer hang restart variants
+    LoadStringW(h, 0xFDC, g_hangRestartBtnOn, 256);
+    LoadStringW(h, 0x105, g_hangRestartBtnOff, 256);
+    LoadStringW(h, 0xFC3, g_hangRestartCtOn, 512);
+    LoadStringW(h, 0xFC4, g_hangRestartCtOff, 512);
+    FreeLibrary(h);
+}
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"Mod initializing...");
+
+    // Read DefaultConsent: HKCU first, HKLM if not exists
+    DWORD cb = sizeof(g_defaultConsent);
+    DWORD regFlags = RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY;
+    if (RegGetValueW(HKEY_CURRENT_USER,
+            L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\Consent",
+            L"DefaultConsent", regFlags, NULL,
+            &g_defaultConsent, &cb) != ERROR_SUCCESS) {
+        cb = sizeof(g_defaultConsent);
+        RegGetValueW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\Consent",
+            L"DefaultConsent", regFlags, NULL,
+            &g_defaultConsent, &cb);
+    }
+
+    // If consent not found, try reading from the target process's user registry via token impersonation.
+    if (g_defaultConsent < 1 || g_defaultConsent > 4) {
+        LPWSTR cmdChk = GetCommandLineW();
+        LPCWSTR pfChk = cmdChk ? wcsstr(cmdChk, L"-p ") : NULL;
+        if (!pfChk) pfChk = cmdChk ? wcsstr(cmdChk, L"/p ") : NULL;
+        if (pfChk) {
+            DWORD tgtPid = (DWORD)_wtoi(pfChk + 3);
+            if (tgtPid) {
+                HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, tgtPid);
+                if (hProc) {
+                    HANDLE hToken = NULL;
+                    if (OpenProcessToken(hProc, TOKEN_READ | TOKEN_IMPERSONATE | TOKEN_DUPLICATE, &hToken)) {
+                        if (ImpersonateLoggedOnUser(hToken)) {
+                            HKEY hk = NULL;
+                            if (RegOpenCurrentUser(KEY_READ, &hk) == ERROR_SUCCESS) {
+                                HKEY hConsent = NULL;
+                                if (RegOpenKeyExW(hk,
+                                        L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\Consent",
+                                        0, KEY_READ, &hConsent) == ERROR_SUCCESS) {
+                                    cb = sizeof(g_defaultConsent);
+                                    RegQueryValueExW(hConsent, L"DefaultConsent", NULL, NULL,
+                                                     (LPBYTE)&g_defaultConsent, &cb);
+                                    RegCloseKey(hConsent);
+                                }
+                                RegCloseKey(hk);
+                            }
+                            RevertToSelf();
+                        }
+                        CloseHandle(hToken);
+                    }
+                    CloseHandle(hProc);
+                }
+            }
+        }
+    }
+
+    Wh_Log(L"DefaultConsent=%d", g_defaultConsent);
+    if (g_defaultConsent < 1 || g_defaultConsent > 4) return FALSE;
+
+    // Detect if the target process is explorer.exe
+    LPWSTR cmd = GetCommandLineW();
+    if (cmd) {
+        LPCWSTR pf = wcsstr(cmd, L"-p ");
+        if (!pf) pf = wcsstr(cmd, L"/p ");
+        if (pf) {
+            DWORD pid = (DWORD)_wtoi(pf + 3);
+            if (pid) {
+                HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                           FALSE, pid);
+                if (hProc) {
+                    wchar_t exePath[MAX_PATH] = {0};
+                    DWORD sz = MAX_PATH;
+                    if (QueryFullProcessImageNameW(hProc, 0, exePath, &sz)) {
+                        LPCWSTR exeName = wcsrchr(exePath, L'\\');
+                        exeName = exeName ? exeName + 1 : exePath;
+                        g_targetIsExplorer = (_wcsicmp(exeName, L"explorer.exe") == 0);
+                    }
+                    CloseHandle(hProc);
+                }
+            }
+        }
+    }
+
+    LoadMuiStrings();
+
+    // Install hooks for DLLs already loaded
+    HMODULE hWerui = GetModuleHandleW(L"werui.dll");
+    if (hWerui) InstallWeruiDllHooks(hWerui);
+
+    // Set up loading hooks if werui not present
+    if (!hWerui) {
+        Wh_SetFunctionHook((void*)LoadLibraryExW, (void*)LoadLibraryExW_hook,
+                           (void**)&LoadLibraryExW_orig);
+        Wh_SetFunctionHook((void*)LoadLibraryW, (void*)LoadLibraryW_hook,
+                           (void**)&LoadLibraryW_orig);
+#ifndef _WIN64
+        Wh_SetFunctionHook((void*)LoadLibraryA, (void*)LoadLibraryA_hook,
+                           (void**)&LoadLibraryA_orig);
+        Wh_SetFunctionHook((void*)LoadLibraryExA, (void*)LoadLibraryExA_hook,
+                           (void**)&LoadLibraryExA_orig);
+#endif
+        HMODULE hNt = GetModuleHandleW(L"ntdll.dll");
+        if (hNt) {
+            void* p = (void*)GetProcAddress(hNt, "LdrLoadDll");
+            if (p) Wh_SetFunctionHook(p, (void*)LdrLoadDll_hook,
+                                       (void**)&LdrLoadDll_orig);
+        }
+    }
+
+    // Install wer.dll hooks
+    HMODULE hWer = GetModuleHandleW(L"wer.dll");
+    if (hWer) InstallWerDllHooks(hWer);
+
+    // Apply everything so hooks are active before ReportProblem runs
+    Wh_ApplyHookOperations();
+
+    Wh_Log(L"Hooks installed (consent %d)", g_defaultConsent);
+    return TRUE;
+}
+
+void Wh_ModUninit() {
+}

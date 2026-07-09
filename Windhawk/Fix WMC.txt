@@ -1,0 +1,44 @@
+// ==WindhawkMod==
+// @id              fix-wmc-mojibake
+// @name            Fix Windows Media Center's mojibake titlebar on older versions
+// @description     This mod fixes a bug in versions of Windows Media Center where the titlebar text becomes mojibake.
+// @version         0.1
+// @author          patricktbp
+// @include         ehshell.exe
+// ==/WindhawkMod==
+
+#include <windows.h>
+
+typedef LRESULT (WINAPI *DefWindowProcW_t)(HWND, UINT, WPARAM, LPARAM);
+DefWindowProcW_t pOriginalDefWindowProcW = nullptr;
+
+LRESULT WINAPI DefWindowProcWHook(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (Msg == WM_SETTEXT) {
+        LPCSTR pszAnsi = (LPCSTR)lParam;
+        
+        // We check here if it's actually broken ANSI, if it is there replace it.
+        // (e.g. whether the second byte is not zero, which would suggest ANSI encoding)
+        if (pszAnsi && pszAnsi[1] != '\0') {
+            int len = MultiByteToWideChar(CP_ACP, 0, pszAnsi, -1, nullptr, 0);
+            if (len > 1) {
+                WCHAR* realWide = new WCHAR[len];
+                MultiByteToWideChar(CP_ACP, 0, pszAnsi, -1, realWide, len);
+
+                // We replace the titlebar text parameter and call the hook
+                LRESULT res = pOriginalDefWindowProcW(hWnd, Msg, wParam, (LPARAM)realWide);
+                delete[] realWide;
+                return res;
+            }
+        }
+    }
+    return pOriginalDefWindowProcW(hWnd, Msg, wParam, lParam);
+}
+
+BOOL Wh_ModInit() {
+    Wh_SetFunctionHook(
+        (void *)GetProcAddress(GetModuleHandle(L"user32.dll"), "DefWindowProcW"),
+        (void *)DefWindowProcWHook,
+        (void **)&pOriginalDefWindowProcW
+    );
+    return TRUE;
+}

@@ -1,0 +1,77 @@
+// ==WindhawkMod==
+// @id              themecpl-rounded-corners
+// @name            Personalization Rounded Corners
+// @version         1.0
+// @author          xalejandro
+// @github          https://github.com/tetawaves
+// @include         explorer.exe
+// @compilerOptions -lgdi32
+// ==/WindhawkMod==
+
+#include <windhawk_utils.h>
+
+#ifdef _WIN64
+#define THISCALL  __cdecl
+#define STHISCALL L"__cdecl"
+#else
+#define THISCALL  __thiscall
+#define STHISCALL L"__thiscall"
+#endif
+
+// Hardcoded values in themeui.dll, they do not scale with DPI and are always the same
+RECT rectColorSwatch = {3, 3, 253, 253};
+RECT rectThumbnailColorSwatch = {3, 137, 253, 387};
+
+// 30 in windows 7
+int g_cornerRadius = 30;
+
+void (THISCALL *AlphaFillRegion_orig)(HDC, DWORD, HRGN, RECT);
+void THISCALL AlphaFillRegion_hook(HDC hDC, DWORD argb, HRGN hRGN, RECT rc)
+{
+    RECT rectRgn {0, 0, 0, 0};
+    GetRgnBox(hRGN, &rectRgn);
+    if (EqualRect(&rectRgn, &rectColorSwatch) || EqualRect(&rectRgn, &rectThumbnailColorSwatch))
+    {
+        hRGN = CreateRoundRectRgn(
+            rectRgn.left,
+            rectRgn.bottom,
+            rectRgn.right,
+            rectRgn.top,
+            g_cornerRadius,
+            g_cornerRadius);
+    }
+    return AlphaFillRegion_orig(hDC, argb, hRGN, rc);
+}
+
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"Init");
+
+    HMODULE hThemeui = LoadLibraryW(L"themeui.dll");
+    if (!hThemeui)
+    {
+        Wh_Log(L"Failed to load themeui.dll");
+        return FALSE;
+    }
+
+    const WindhawkUtils::SYMBOL_HOOK themeUiDllHooks[]
+    {
+        {
+            {
+                L"void __cdecl AlphaFillRegion(struct HDC__ *,unsigned long,struct HRGN__ *,struct tagRECT *)"
+            },
+            &AlphaFillRegion_orig,
+            AlphaFillRegion_hook,
+            false
+        },
+    };
+
+    if (!WindhawkUtils::HookSymbols(hThemeui, themeUiDllHooks,
+                                    ARRAYSIZE(themeUiDllHooks)))
+    {
+        Wh_Log(L"Failed to hook themeui.dll");
+        return FALSE;
+    }
+
+    return TRUE;
+}

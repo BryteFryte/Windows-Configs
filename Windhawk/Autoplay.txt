@@ -1,0 +1,5968 @@
+// ==WindhawkMod==
+
+// @id win7-autoplay-dialog
+
+// @name Windows 7 AutoPlay Dialog
+
+// @description Recreated classic Windows 7 AutoPlay Dialog
+
+// @version 1.0.0
+
+// @author Azuzu
+
+// @include explorer.exe
+
+// @compilerOptions -lole32 -loleaut32 -lshlwapi -lshell32 -lcomctl32 -luxtheme -lversion -lcfgmgr32 -luuid -lgdi32
+
+// ==/WindhawkMod==
+
+
+
+// ==WindhawkModReadme==
+
+/*
+
+# Windows 7 AutoPlay Dialog
+
+
+
+## Features
+
+- Pixel-accurate Windows 7 AutoPlay dialog (grouped handler list, icon,
+
+"Always do this" checkbox, Control Panel link)
+
+- Full MTP/WPD support (phones, cameras, media players) via IPortableDeviceManager
+
+- Volumes: USB flash drives, CD/DVD, external hard drives
+
+- Autorun.inf parsing (shows program name + publisher from version info)
+
+- Policy enforcement (NoDriveTypeAutoRun, NoDriveAutoRun, DisableAutoplay)
+
+- IQueryCancelAutoPlay COM check (lets apps like WMP suppress the dialog)
+
+- KnownDevices deduplication (no repeated dialogs for the same device)
+
+- "Always do this" persists to HKCU UserChosenExecuteHandlers
+
+- Classic theme and Aero theme both supported
+
+- All standard Windows handler verbs supported (IHWEventHandler, ProgID+verb,
+
+shell command)
+
+
+
+## How it works
+
+Windhawk injects this mod into explorer.exe. The mod registers a
+
+CM_Register_Notification callback for device arrivals, intercepts them before
+
+Explorer's own AutoPlay fires, and shows the Win7 dialog on a worker thread.
+
+Explorer's own AutoPlay is suppressed via IQueryCancelAutoPlay registration
+
+(the mod registers itself under CancelAutoplay\CLSID in HKCU).
+
+
+
+## Notes
+
+- Run Explorer as the injected process (default Windhawk target)
+
+- The mod self-registers/unregisters IQueryCancelAutoPlay on load/unload
+
+- First insertion after install may show both dialogs; subsequent ones will
+
+only show the Win7 dialog
+
+*/
+
+// ==/WindhawkModReadme==
+
+
+
+#ifndef WIN32_LEAN_AND_MEAN
+
+#define WIN32_LEAN_AND_MEAN
+
+#endif
+
+#ifndef UNICODE
+
+#define UNICODE
+
+#endif
+
+#ifndef _UNICODE
+
+#define _UNICODE
+
+#endif
+
+#ifndef NOMINMAX
+
+#define NOMINMAX
+
+#endif
+
+
+
+#include <windows.h>
+
+#include <algorithm>
+
+#include <commctrl.h>
+
+#include <commoncontrols.h> // IImageList full definition
+
+#include <shlobj.h>
+
+#include <shlwapi.h>
+
+#include <shellapi.h>
+
+#include <uxtheme.h>
+
+#include <vsstyle.h>
+
+#include <vssym32.h>
+
+#include <strsafe.h>
+
+#include <shobjidl.h>
+
+#include <string>
+
+#include <vector>
+
+#include <memory>
+
+#include <utility>
+
+#include <dbt.h>
+
+#include <map>
+
+#include <set>
+
+#include <process.h>
+
+#include <unordered_set>
+
+#include <cfgmgr32.h>
+
+#include <devpkey.h>
+
+#include <portabledeviceapi.h>
+
+#include <portabledevice.h>
+
+#include <initguid.h>
+
+
+
+
+
+#include <windhawk_api.h>
+
+
+
+// ---------------------------------------------------------------------------
+
+// IHWEventHandler2 guard
+
+// ---------------------------------------------------------------------------
+
+#ifndef __IHWEventHandler2_INTERFACE_DEFINED__
+
+#define __IHWEventHandler2_INTERFACE_DEFINED__
+
+MIDL_INTERFACE("CFCC809F-295D-42e8-9FFC-424B33C487E6")
+
+IHWEventHandler2 : public IHWEventHandler
+
+{
+
+public:
+
+virtual HRESULT STDMETHODCALLTYPE HandleEventWithHWND(
+
+_In_ LPCWSTR pszDeviceID,
+
+_In_ LPCWSTR pszAltDeviceID,
+
+_In_ LPCWSTR pszEventType,
+
+_In_ HWND hwndOwner) = 0;
+
+};
+
+#endif
+
+
+
+// ---------------------------------------------------------------------------
+
+// SHSTOCKICONID values
+
+// ---------------------------------------------------------------------------
+
+#ifndef SIID_CDROM
+
+#define SIID_CDROM 11
+
+#endif
+
+#ifndef SIID_DEVICECELLPHONE
+
+#define SIID_DEVICECELLPHONE 70
+
+#endif
+
+
+
+// ---------------------------------------------------------------------------
+
+// Dialog / control IDs (matching Win7 shell32 dialog 1121)
+
+// ---------------------------------------------------------------------------
+
+#define IDD_AUTOPLAY 1121
+
+#define IDC_AUTOPLAY_ICON 1000
+
+#define IDC_AUTOPLAY_TITLE 1001
+
+#define IDC_AUTOPLAY_SEARCHING 1002
+
+#define IDC_AUTOPLAY_NEWHANDLER 1003
+
+#define IDC_AUTOPLAY_PROGRESS 1004
+
+#define IDC_AUTOPLAY_ALWAYSDO 1005
+
+#define IDC_AUTOPLAY_DEFAULT_MSG 1006
+
+#define IDC_AUTOPLAY_LIST 1008
+
+#define IDC_AUTOPLAY_CPLLINK 1009
+
+
+
+// Custom window messages
+
+#define WM_AUTOPLAY_NEWCONTENT (WM_USER + 1)
+
+#define WM_AUTOPLAY_SNIFFCOMPLETE (WM_USER + 2)
+
+#define WM_AP_ARRIVED (WM_USER + 10)
+
+#define WM_AP_REMOVED (WM_USER + 11)
+
+
+
+// Content type flags
+
+#define AUTOPLAY_CONTENT_AUTORUN 0x0001
+
+#define AUTOPLAY_CONTENT_MUSIC 0x0002
+
+#define AUTOPLAY_CONTENT_PICTURES 0x0004
+
+#define AUTOPLAY_CONTENT_VIDEO 0x0008
+
+#define AUTOPLAY_CONTENT_MIX 0x0100
+
+#define AUTOPLAY_CONTENT_BLANK_CD 0x0200
+
+#define AUTOPLAY_CONTENT_BLANK_DVD 0x0400
+
+#define AUTOPLAY_CONTENT_OPENCPANEL 0x8000
+
+
+
+// Registry paths
+
+#define REGPATH_HANDLERS L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers\\Handlers"
+
+#define REGPATH_EVENTHANDLERS L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers\\EventHandlers\\"
+
+#define REGPATH_DEFAULTS L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers"
+
+
+
+// Built-in handler IDs
+
+#define HANDLER_TAKE_NO_ACTION L"MSTakeNoAction"
+
+#define HANDLER_PROMPT_EACH L"MSPromptEachTime"
+
+#define HANDLER_OPEN_FOLDER L"MSOpenFolder"
+
+
+
+// String IDs (inline since we have no RC in a Windhawk mod strings are hardcoded below)
+
+#define IDS_ALWAYS_DO_DEVICE 200
+
+#define IDS_ALWAYS_DO_MUSIC 201
+
+#define IDS_ALWAYS_DO_PICTURES 202
+
+#define IDS_ALWAYS_DO_VIDEO 203
+
+#define IDS_ALWAYS_DO_AUTORUN 204
+
+#define IDS_ALWAYS_DO_BLANK_CD 205
+
+#define IDS_ALWAYS_DO_BLANK_DVD 206
+
+#define IDS_GROUP_DEVICE 207
+
+#define IDS_GROUP_MIXED 208
+
+#define IDS_GROUP_GENERAL 209
+
+#define IDS_PUBLISHED_BY 210
+
+#define IDS_PUBLISHER_NOT_SPECIFIED 211
+
+#define IDS_RUN_PROGRAM 212
+
+#define IDS_RUN_EXE 213
+
+#define IDS_REMOVABLE_DISK 214
+
+#define IDS_AUTOPLAY_TITLE 215
+
+#define IDS_INSTALL_OR_RUN 216
+
+#define IDS_AUDIO_OPTIONS 217
+
+#define IDS_PICTURE_OPTIONS 218
+
+#define IDS_VIDEO_OPTIONS 219
+
+#define IDS_BLANK_CD_OPTIONS 220
+
+#define IDS_BLANK_DVD_OPTIONS 221
+
+#define IDS_MIXED_OPTIONS 222
+
+#define IDS_GENERAL_OPTIONS 223
+
+#define IDS_SEARCHING 230
+
+#define IDS_DEFAULT_ACTION_MSG 231
+
+#define IDS_NEW_OPTIONS_MSG 232
+
+#define IDS_CPLLINK_TEXT 233
+
+#define IDS_UNKNOWN_DEVICE 234
+
+
+
+// ===========================================================================
+
+// String table (replaces RC strings since Windhawk mods can't have resources)
+
+// ===========================================================================
+
+static const wchar_t* GetStr(UINT id)
+
+{
+
+switch (id)
+
+{
+
+case IDS_ALWAYS_DO_DEVICE: return L"Always do this for this device:";
+
+case IDS_ALWAYS_DO_MUSIC: return L"Always do this for audio files:";
+
+case IDS_ALWAYS_DO_PICTURES: return L"Always do this for pictures:";
+
+case IDS_ALWAYS_DO_VIDEO: return L"Always do this for video files:";
+
+case IDS_ALWAYS_DO_AUTORUN: return L"Always do this for software and games:";
+
+case IDS_ALWAYS_DO_BLANK_CD: return L"Always do this for blank CDs:";
+
+case IDS_ALWAYS_DO_BLANK_DVD: return L"Always do this for blank DVDs:";
+
+case IDS_GROUP_DEVICE: return L"Device options";
+
+case IDS_GROUP_MIXED: return L"Mixed content options";
+
+case IDS_GROUP_GENERAL: return L"General options";
+
+case IDS_PUBLISHED_BY: return L"Published by %s";
+
+case IDS_PUBLISHER_NOT_SPECIFIED: return L"Publisher not specified";
+
+case IDS_RUN_PROGRAM: return L"Run program";
+
+case IDS_RUN_EXE: return L"Run %s";
+
+case IDS_REMOVABLE_DISK: return L"Removable Disk (%c:)";
+
+case IDS_AUTOPLAY_TITLE: return L"AutoPlay";
+
+case IDS_INSTALL_OR_RUN: return L"Install or run program from your media";
+
+case IDS_AUDIO_OPTIONS: return L"Audio files options";
+
+case IDS_PICTURE_OPTIONS: return L"Pictures options";
+
+case IDS_VIDEO_OPTIONS: return L"Video files options";
+
+case IDS_BLANK_CD_OPTIONS: return L"Blank CD options";
+
+case IDS_BLANK_DVD_OPTIONS: return L"Blank DVD options";
+
+case IDS_MIXED_OPTIONS: return L"Mixed content options";
+
+case IDS_GENERAL_OPTIONS: return L"General options";
+
+case IDS_SEARCHING: return L"Searching for content...";
+
+case IDS_DEFAULT_ACTION_MSG: return L"Your default action will occur or other options will become available.";
+
+case IDS_NEW_OPTIONS_MSG: return L"New options are available. You can keep the current default or choose a new default below. Defaults can always be changed later in Control Panel.";
+
+case IDS_CPLLINK_TEXT: return L"<A>View more AutoPlay options in Control Panel</A>";
+
+case IDS_UNKNOWN_DEVICE: return L"Unknown Device";
+
+default: return L"";
+
+}
+
+}
+
+
+
+static std::wstring LoadStr(UINT id) { return GetStr(id); }
+
+
+
+static std::wstring LoadStrFmt(UINT id, ...)
+
+{
+
+WCHAR buf[512] = {};
+
+va_list args;
+
+va_start(args, id);
+
+StringCchVPrintfW(buf, ARRAYSIZE(buf), GetStr(id), args);
+
+va_end(args);
+
+return buf;
+
+}
+
+
+
+// ===========================================================================
+
+// Global state
+
+// ===========================================================================
+
+static HINSTANCE g_hInstance = nullptr; // our DLL (injected into Explorer)
+
+static HCMNOTIFICATION g_hCMNotify = nullptr;
+
+static HWND g_hwndMsg = nullptr;
+
+
+
+// DispatchMessageW hook catches WM_DEVICECHANGE already flowing through
+
+// explorer's own message loop (same technique as deviceinstallux)
+
+using DispatchMessageW_t = decltype(&DispatchMessageW);
+
+static DispatchMessageW_t orig_DispatchMessageW = nullptr;
+
+
+
+static void SpawnVolumeDialog(LPCWSTR szPath, bool bFromDeviceChange = false); // forward decl
+
+static void UnregisterKnownDevice(LPCWSTR szDevicePath); // forward decl
+
+static void CloseDialogKey(const std::wstring& key); // forward decl
+
+static void CloseAutoPlayDialogForDrive(WCHAR letter); // forward decl
+
+
+
+static void TrySpawnVolumeDialogForMask(DWORD mask)
+
+{
+
+for (int i = 0; i < 26; i++)
+
+{
+
+if (!(mask & (1u << i))) continue;
+
+WCHAR szDrive[4] = { (WCHAR)(L'A' + i), L':', L'\\', L'\0' };
+
+Wh_Log(L"[DeviceArrival] Volume: %s", szDrive);
+
+struct VA { std::wstring path; };
+
+auto* va = new VA{ szDrive };
+
+HANDLE h = CreateThread(nullptr, 0,
+
+[](LPVOID pv) __attribute__((stdcall)) -> DWORD {
+
+auto* va2 = reinterpret_cast<VA*>(pv);
+
+HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+SpawnVolumeDialog(va2->path.c_str(), true);
+
+if (SUCCEEDED(hr)) CoUninitialize();
+
+delete va2; return 0;
+
+}, va, 0, nullptr);
+
+if (h) CloseHandle(h); else delete va;
+
+}
+
+}
+
+
+
+LRESULT WINAPI hook_DispatchMessageW(const MSG* lpMsg)
+
+{
+
+if (lpMsg && lpMsg->message == WM_DEVICECHANGE)
+
+{
+
+auto* hdr = reinterpret_cast<DEV_BROADCAST_HDR*>(lpMsg->lParam);
+
+if (lpMsg->wParam == DBT_DEVICEARRIVAL &&
+
+hdr && hdr->dbch_devicetype == DBT_DEVTYP_VOLUME)
+
+{
+
+auto* vol = reinterpret_cast<DEV_BROADCAST_VOLUME*>(lpMsg->lParam);
+
+TrySpawnVolumeDialogForMask(vol->dbcv_unitmask);
+
+}
+
+else if (lpMsg->wParam == DBT_DEVICEREMOVECOMPLETE &&
+
+hdr && hdr->dbch_devicetype == DBT_DEVTYP_VOLUME)
+
+{
+
+auto* vol = reinterpret_cast<DEV_BROADCAST_VOLUME*>(lpMsg->lParam);
+
+for (int i = 0; i < 26; i++)
+
+{
+
+if (!(vol->dbcv_unitmask & (1u << i))) continue;
+
+WCHAR szDrive[4] = { (WCHAR)(L'A' + i), L':', L'\\', L'\0' };
+
+CloseAutoPlayDialogForDrive(L'A' + i);
+
+UnregisterKnownDevice(szDrive);
+
+CloseDialogKey(std::wstring(szDrive));
+
+}
+
+}
+
+}
+
+return orig_DispatchMessageW ? orig_DispatchMessageW(lpMsg) : 0;
+
+}
+
+
+
+// Device icon cache: device path -> HICON
+
+static std::map<std::wstring, HICON> g_deviceIcons;
+
+
+
+// Open dialog deduplication
+
+static std::set<std::wstring> g_openDialogKeys;
+
+static CRITICAL_SECTION g_csDialogKeys;
+
+static bool g_csDialogKeysInit = false;
+
+
+
+static void EnsureDialogCS()
+
+{
+
+if (!g_csDialogKeysInit)
+
+{
+
+InitializeCriticalSection(&g_csDialogKeys);
+
+g_csDialogKeysInit = true;
+
+}
+
+}
+
+
+
+static bool TryOpenDialog(const std::wstring& key)
+
+{
+
+EnsureDialogCS();
+
+EnterCriticalSection(&g_csDialogKeys);
+
+bool inserted = g_openDialogKeys.insert(key).second;
+
+LeaveCriticalSection(&g_csDialogKeys);
+
+return inserted;
+
+}
+
+
+
+static void CloseDialogKey(const std::wstring& key)
+
+{
+
+if (!g_csDialogKeysInit) return;
+
+EnterCriticalSection(&g_csDialogKeys);
+
+g_openDialogKeys.erase(key);
+
+LeaveCriticalSection(&g_csDialogKeys);
+
+}
+
+
+
+// Per-dialog tracking (drive-letter and MTP dialogs, for close-on-removal)
+
+static CRITICAL_SECTION g_csDialogs;
+
+static std::map<WCHAR, HWND> g_openVolDialogs;
+
+static std::map<std::wstring, HWND> g_openMTPDialogs;
+
+static bool g_csDialogsInit = false;
+
+
+
+static void EnsureDialogsCS()
+
+{
+
+if (!g_csDialogsInit)
+
+{
+
+InitializeCriticalSection(&g_csDialogs);
+
+g_csDialogsInit = true;
+
+}
+
+}
+
+
+
+static void RegisterVolDialog(WCHAR letter, HWND hwnd)
+
+{
+
+EnsureDialogsCS();
+
+EnterCriticalSection(&g_csDialogs);
+
+g_openVolDialogs[towupper(letter)] = hwnd;
+
+LeaveCriticalSection(&g_csDialogs);
+
+}
+
+
+
+static void UnregisterVolDialog(WCHAR letter)
+
+{
+
+if (!g_csDialogsInit) return;
+
+EnterCriticalSection(&g_csDialogs);
+
+g_openVolDialogs.erase(towupper(letter));
+
+LeaveCriticalSection(&g_csDialogs);
+
+}
+
+
+
+static void RegisterMTPDialog(const std::wstring& key, HWND hwnd)
+
+{
+
+EnsureDialogsCS();
+
+EnterCriticalSection(&g_csDialogs);
+
+g_openMTPDialogs[key] = hwnd;
+
+LeaveCriticalSection(&g_csDialogs);
+
+}
+
+
+
+static void UnregisterMTPDialog(const std::wstring& key)
+
+{
+
+if (!g_csDialogsInit) return;
+
+EnterCriticalSection(&g_csDialogs);
+
+g_openMTPDialogs.erase(key);
+
+LeaveCriticalSection(&g_csDialogs);
+
+}
+
+
+
+static void CloseAutoPlayDialogForDrive(WCHAR letter)
+
+{
+
+if (!g_csDialogsInit) return;
+
+EnterCriticalSection(&g_csDialogs);
+
+auto it = g_openVolDialogs.find(towupper(letter));
+
+HWND hwnd = (it != g_openVolDialogs.end()) ? it->second : nullptr;
+
+LeaveCriticalSection(&g_csDialogs);
+
+if (hwnd && IsWindow(hwnd)) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+
+}
+
+
+
+static void CloseAutoPlayDialogForDevice(LPCWSTR pszDeviceId)
+
+{
+
+if (!g_csDialogsInit || !pszDeviceId) return;
+
+EnterCriticalSection(&g_csDialogs);
+
+auto it = g_openMTPDialogs.find(pszDeviceId);
+
+HWND hwnd = (it != g_openMTPDialogs.end()) ? it->second : nullptr;
+
+LeaveCriticalSection(&g_csDialogs);
+
+if (hwnd && IsWindow(hwnd)) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+
+}
+
+
+
+// ===========================================================================
+
+// HandlerEntry
+
+// ===========================================================================
+
+struct HandlerEntry
+
+{
+
+std::wstring id;
+
+std::wstring action;
+
+std::wstring provider;
+
+std::wstring iconLocation;
+
+std::wstring progId;
+
+std::wstring verb;
+
+std::wstring command;
+
+std::wstring initCmdLine;
+
+std::wstring eventHandler;
+
+CLSID clsid = {};
+
+HICON hIcon = nullptr;
+
+FILETIME lastWrite = {};
+
+
+
+HandlerEntry() { ZeroMemory(&clsid, sizeof(clsid)); ZeroMemory(&lastWrite, sizeof(lastWrite)); }
+
+~HandlerEntry() { if (hIcon) { DestroyIcon(hIcon); hIcon = nullptr; } }
+
+HandlerEntry(const HandlerEntry&) = delete;
+
+HandlerEntry& operator=(const HandlerEntry&) = delete;
+
+HandlerEntry(HandlerEntry&&) = default;
+
+HandlerEntry& operator=(HandlerEntry&&) = default;
+
+};
+
+
+
+// ===========================================================================
+
+// Registry helpers
+
+// ===========================================================================
+
+static bool RegReadString(HKEY hKey, LPCWSTR pszValue, std::wstring& out)
+
+{
+
+DWORD dwType = 0, cbData = 0;
+
+if (RegQueryValueExW(hKey, pszValue, nullptr, &dwType, nullptr, &cbData) != ERROR_SUCCESS)
+
+return false;
+
+if (cbData == 0) { out.clear(); return true; }
+
+std::wstring buf(cbData / sizeof(WCHAR) + 2, L'\0');
+
+if (RegQueryValueExW(hKey, pszValue, nullptr, &dwType,
+
+reinterpret_cast<LPBYTE>(&buf[0]), &cbData) != ERROR_SUCCESS)
+
+return false;
+
+buf.resize(wcsnlen(buf.data(), buf.size()));
+
+if (dwType == REG_EXPAND_SZ)
+
+{
+
+WCHAR exp[MAX_PATH * 2] = {};
+
+ExpandEnvironmentStringsW(buf.c_str(), exp, ARRAYSIZE(exp));
+
+out = exp;
+
+}
+
+else out = buf;
+
+return true;
+
+}
+
+
+
+static std::wstring ResolveIndirect(const std::wstring& src)
+
+{
+
+if (src.empty() || src[0] != L'@') return src;
+
+WCHAR buf[512] = {};
+
+if (SUCCEEDED(SHLoadIndirectString(src.c_str(), buf, ARRAYSIZE(buf), nullptr)))
+
+return buf;
+
+return src;
+
+}
+
+
+
+// ===========================================================================
+
+// File scanning helpers
+
+// ===========================================================================
+
+static std::vector<std::wstring> GetExtensionsForEvent(const std::wstring& ev)
+
+{
+
+if (ev == L"PlayMusicFilesOnArrival")
+
+return { L"mp3",L"flac",L"wav",L"wma",L"aac",L"ogg",L"m4a",L"opus",L"aiff",L"ape" };
+
+if (ev == L"ShowPicturesOnArrival")
+
+return { L"jpg",L"jpeg",L"png",L"bmp",L"gif",L"tiff",L"tif",L"webp",L"heic",L"raw",L"cr2",L"nef" };
+
+if (ev == L"PlayVideoFilesOnArrival")
+
+return { L"mp4",L"avi",L"mkv",L"mov",L"wmv",L"m4v",L"flv",L"mpg",L"mpeg",L"ts",L"vob",L"webm" };
+
+return {};
+
+}
+
+
+
+static std::vector<std::wstring> ScanFilesForExtensions(
+
+LPCWSTR pwszDevicePath, const std::vector<std::wstring>& exts)
+
+{
+
+std::vector<std::wstring> files;
+
+if (!pwszDevicePath) return files;
+
+for (auto& ext : exts)
+
+{
+
+WCHAR szSearch[MAX_PATH] = {};
+
+StringCchPrintfW(szSearch, ARRAYSIZE(szSearch), L"%s*.%s", pwszDevicePath, ext.c_str());
+
+WIN32_FIND_DATAW fd = {};
+
+HANDLE h = FindFirstFileW(szSearch, &fd);
+
+if (h == INVALID_HANDLE_VALUE) continue;
+
+do {
+
+if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+WCHAR szFull[MAX_PATH] = {};
+
+StringCchPrintfW(szFull, ARRAYSIZE(szFull), L"%s%s", pwszDevicePath, fd.cFileName);
+
+files.push_back(szFull);
+
+} while (FindNextFileW(h, &fd));
+
+FindClose(h);
+
+}
+
+return files;
+
+}
+
+
+
+static bool HasFiles(LPCWSTR pwszPath, LPCWSTR pwszPattern)
+
+{
+
+WCHAR szSearch[MAX_PATH] = {};
+
+StringCchPrintfW(szSearch, ARRAYSIZE(szSearch), L"%s%s", pwszPath, pwszPattern);
+
+WIN32_FIND_DATAW fd = {};
+
+HANDLE h = FindFirstFileW(szSearch, &fd);
+
+if (h != INVALID_HANDLE_VALUE) { FindClose(h); return true; }
+
+WCHAR szDirs[MAX_PATH] = {};
+
+StringCchPrintfW(szDirs, ARRAYSIZE(szDirs), L"%s*", pwszPath);
+
+h = FindFirstFileW(szDirs, &fd);
+
+if (h == INVALID_HANDLE_VALUE) return false;
+
+do {
+
+if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+
+if (fd.cFileName[0] == L'.') continue;
+
+WCHAR szSub[MAX_PATH] = {};
+
+StringCchPrintfW(szSub, ARRAYSIZE(szSub), L"%s%s\\%s", pwszPath, fd.cFileName, pwszPattern);
+
+WIN32_FIND_DATAW fd2 = {};
+
+HANDLE h2 = FindFirstFileW(szSub, &fd2);
+
+if (h2 != INVALID_HANDLE_VALUE) { FindClose(h2); FindClose(h); return true; }
+
+} while (FindNextFileW(h, &fd));
+
+FindClose(h);
+
+return false;
+
+}
+
+
+
+static DWORD DetectContent(LPCWSTR szPath)
+
+{
+
+if (!szPath || !szPath[0]) return 0;
+
+UINT t = GetDriveTypeW(szPath);
+
+DWORD f = 0;
+
+switch (t)
+
+{
+
+case DRIVE_CDROM:
+
+if (HasFiles(szPath, L"autorun.inf")) f = AUTOPLAY_CONTENT_AUTORUN;
+
+else if (HasFiles(szPath, L"*.mp3") || HasFiles(szPath, L"*.wav") ||
+
+HasFiles(szPath, L"*.wma") || HasFiles(szPath, L"*.flac") ||
+
+HasFiles(szPath, L"*.aac") || HasFiles(szPath, L"*.ogg")) f = AUTOPLAY_CONTENT_MUSIC;
+
+else if (HasFiles(szPath, L"*.mp4") || HasFiles(szPath, L"*.avi") ||
+
+HasFiles(szPath, L"*.mkv") || HasFiles(szPath, L"*.mov") ||
+
+HasFiles(szPath, L"*.wmv") || HasFiles(szPath, L"*.vob")) f = AUTOPLAY_CONTENT_VIDEO;
+
+else f = AUTOPLAY_CONTENT_BLANK_CD;
+
+break;
+
+case DRIVE_REMOVABLE: case DRIVE_FIXED:
+
+if (HasFiles(szPath, L"autorun.inf") || HasFiles(szPath, L"setup.exe") ||
+
+HasFiles(szPath, L"install.exe") || HasFiles(szPath, L"setup.msi"))
+
+f |= AUTOPLAY_CONTENT_AUTORUN;
+
+if (HasFiles(szPath, L"*.mp3") || HasFiles(szPath, L"*.flac") || HasFiles(szPath, L"*.wav") ||
+
+HasFiles(szPath, L"*.wma") || HasFiles(szPath, L"*.aac") || HasFiles(szPath, L"*.ogg") ||
+
+HasFiles(szPath, L"*.m4a") || HasFiles(szPath, L"*.opus"))
+
+f |= AUTOPLAY_CONTENT_MUSIC;
+
+if (HasFiles(szPath, L"*.jpg") || HasFiles(szPath, L"*.jpeg") || HasFiles(szPath, L"*.png") ||
+
+HasFiles(szPath, L"*.bmp") || HasFiles(szPath, L"*.gif") || HasFiles(szPath, L"*.tiff") ||
+
+HasFiles(szPath, L"*.webp") || HasFiles(szPath, L"*.heic") || HasFiles(szPath, L"*.cr2") ||
+
+HasFiles(szPath, L"*.nef"))
+
+f |= AUTOPLAY_CONTENT_PICTURES;
+
+if (HasFiles(szPath, L"*.mp4") || HasFiles(szPath, L"*.avi") || HasFiles(szPath, L"*.mkv") ||
+
+HasFiles(szPath, L"*.mov") || HasFiles(szPath, L"*.wmv") || HasFiles(szPath, L"*.m4v") ||
+
+HasFiles(szPath, L"*.flv") || HasFiles(szPath, L"*.mpg") || HasFiles(szPath, L"*.mpeg") ||
+
+HasFiles(szPath, L"*.ts") || HasFiles(szPath, L"*.vob") || HasFiles(szPath, L"*.webm"))
+
+f |= AUTOPLAY_CONTENT_VIDEO;
+
+if (f == 0) f = AUTOPLAY_CONTENT_OPENCPANEL;
+
+break;
+
+default:
+
+f = AUTOPLAY_CONTENT_OPENCPANEL;
+
+break;
+
+}
+
+return f;
+
+}
+
+
+
+// ===========================================================================
+
+// Handler loading from registry
+
+// ===========================================================================
+
+static std::shared_ptr<HandlerEntry> LoadHandlerFromKey(
+
+HKEY hRoot, LPCWSTR pwszName, LPCWSTR pwszEvent)
+
+{
+
+HKEY hSub = nullptr;
+
+if (RegOpenKeyExW(hRoot, pwszName, 0, KEY_READ, &hSub) != ERROR_SUCCESS)
+
+return nullptr;
+
+
+
+auto e = std::make_shared<HandlerEntry>();
+
+e->id = pwszName;
+
+e->eventHandler = pwszEvent ? pwszEvent : L"";
+
+
+
+std::wstring raw;
+
+if (RegReadString(hSub, L"Action", raw)) e->action = ResolveIndirect(raw);
+
+if (RegReadString(hSub, L"Provider", raw) && !raw.empty())
+
+{
+
+e->provider = ResolveIndirect(raw);
+
+if (!e->provider.empty() && e->provider.find(L"using ") == std::wstring::npos)
+
+e->provider = L"using " + e->provider;
+
+}
+
+if (RegReadString(hSub, L"DefaultIcon", raw)) e->iconLocation = raw;
+
+if (!RegReadString(hSub, L"InvokeProgID", e->progId))
+
+RegReadString(hSub, L"InvokeProgId", e->progId);
+
+RegReadString(hSub, L"InvokeVerb", e->verb);
+
+RegReadString(hSub, L"InitCmdLine", e->initCmdLine);
+
+
+
+if (!e->progId.empty()) CLSIDFromProgID(e->progId.c_str(), &e->clsid);
+
+
+
+std::wstring clsidStr;
+
+if (RegReadString(hSub, L"CLSID", clsidStr) && !clsidStr.empty())
+
+CLSIDFromString(clsidStr.c_str(), &e->clsid);
+
+
+
+if (!e->progId.empty() && !e->verb.empty())
+
+{
+
+WCHAR cmd[MAX_PATH * 2] = {};
+
+DWORD cch = ARRAYSIZE(cmd);
+
+if (SUCCEEDED(AssocQueryStringW(0, ASSOCSTR_COMMAND,
+
+e->progId.c_str(), e->verb.c_str(), cmd, &cch)))
+
+e->command = cmd;
+
+}
+
+
+
+// Provider fallbacks
+
+if (e->provider.empty() && !e->progId.empty())
+
+{
+
+WCHAR szFriendly[256] = {};
+
+DWORD cch = ARRAYSIZE(szFriendly);
+
+if (SUCCEEDED(AssocQueryStringW(0, ASSOCSTR_FRIENDLYAPPNAME,
+
+e->progId.c_str(), nullptr, szFriendly, &cch)) && szFriendly[0])
+
+{
+
+e->provider = L"using ";
+
+e->provider += szFriendly;
+
+}
+
+}
+
+if (e->provider.empty() && !IsEqualCLSID(e->clsid, CLSID_NULL))
+
+{
+
+WCHAR szClsid[64] = {};
+
+StringFromGUID2(e->clsid, szClsid, ARRAYSIZE(szClsid));
+
+WCHAR szKey[256] = {};
+
+StringCchPrintfW(szKey, ARRAYSIZE(szKey), L"CLSID\\%s", szClsid);
+
+HKEY hk = nullptr;
+
+if (RegOpenKeyExW(HKEY_CLASSES_ROOT, szKey, 0, KEY_READ, &hk) == ERROR_SUCCESS)
+
+{
+
+WCHAR szName[256] = {};
+
+DWORD cb = sizeof(szName);
+
+if (RegQueryValueExW(hk, L"", nullptr, nullptr,
+
+reinterpret_cast<LPBYTE>(szName), &cb) == ERROR_SUCCESS && szName[0])
+
+{
+
+e->provider = L"using ";
+
+e->provider += szName;
+
+}
+
+RegCloseKey(hk);
+
+}
+
+}
+
+if (e->provider.empty() && !e->command.empty())
+
+{
+
+WCHAR szPath[MAX_PATH] = {};
+
+StringCchCopyW(szPath, ARRAYSIZE(szPath), e->command.c_str());
+
+PathUnquoteSpacesW(szPath);
+
+PathStripPathW(szPath);
+
+PathRemoveExtensionW(szPath);
+
+if (szPath[0]) { e->provider = L"using "; e->provider += szPath; }
+
+}
+
+
+
+RegQueryInfoKeyW(hSub, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+
+nullptr, nullptr, nullptr, &e->lastWrite);
+
+RegCloseKey(hSub);
+
+return e;
+
+}
+
+
+
+static std::vector<std::shared_ptr<HandlerEntry>> LoadHandlersForEventHandler(
+
+LPCWSTR pwszEventHandler, LPCWSTR /*pwszDevicePath*/, DWORD /*dwContentFlags*/)
+
+{
+
+std::vector<std::shared_ptr<HandlerEntry>> results;
+
+WCHAR szEvKey[512] = {};
+
+StringCchPrintfW(szEvKey, ARRAYSIZE(szEvKey),
+
+L"%s%s", REGPATH_EVENTHANDLERS, pwszEventHandler);
+
+
+
+const HKEY roots[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+
+for (int ri = 0; ri < 2; ++ri)
+
+{
+
+HKEY hEvKey = nullptr;
+
+if (RegOpenKeyExW(roots[ri], szEvKey, 0, KEY_READ, &hEvKey) != ERROR_SUCCESS) continue;
+
+
+
+DWORD idx = 0;
+
+WCHAR szName[256] = {};
+
+for (;;)
+
+{
+
+DWORD cch = ARRAYSIZE(szName);
+
+LONG r = RegEnumValueW(hEvKey, idx++, szName, &cch, nullptr, nullptr, nullptr, nullptr);
+
+if (r == ERROR_NO_MORE_ITEMS) break;
+
+if (r != ERROR_SUCCESS || !szName[0]) continue;
+
+if (!lstrcmpiW(szName, HANDLER_TAKE_NO_ACTION)) continue;
+
+if (!lstrcmpiW(szName, HANDLER_PROMPT_EACH)) continue;
+
+
+
+bool dup = false;
+
+for (auto& x : results)
+
+if (!lstrcmpiW(x->id.c_str(), szName)) { dup = true; break; }
+
+if (dup) continue;
+
+
+
+const HKEY handlerRoots[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+
+std::shared_ptr<HandlerEntry> entry;
+
+for (int hr2 = 0; hr2 < 2 && !entry; ++hr2)
+
+{
+
+HKEY hH = nullptr;
+
+if (RegOpenKeyExW(handlerRoots[hr2], REGPATH_HANDLERS, 0, KEY_READ, &hH) == ERROR_SUCCESS)
+
+{
+
+entry = LoadHandlerFromKey(hH, szName, pwszEventHandler);
+
+RegCloseKey(hH);
+
+}
+
+}
+
+if (entry && !entry->action.empty())
+
+results.push_back(std::move(entry));
+
+}
+
+RegCloseKey(hEvKey);
+
+}
+
+return results;
+
+}
+
+
+
+// ===========================================================================
+
+// Handler icon loading
+
+// ===========================================================================
+
+static bool LoadHandlerIcon(HandlerEntry& entry, bool bSmall)
+
+{
+
+if (entry.iconLocation.empty()) return false;
+
+
+
+WCHAR szIcon[MAX_PATH * 2] = {};
+
+StringCchCopyW(szIcon, ARRAYSIZE(szIcon), entry.iconLocation.c_str());
+
+WCHAR szExpanded[MAX_PATH * 2] = {};
+
+ExpandEnvironmentStringsW(szIcon, szExpanded, ARRAYSIZE(szExpanded));
+
+StringCchCopyW(szIcon, ARRAYSIZE(szIcon), szExpanded);
+
+
+
+std::wstring iconStr = szIcon;
+
+int idx = 0;
+
+if (!iconStr.empty() && iconStr[0] == L'"')
+
+{
+
+size_t closeQ = iconStr.find(L'"', 1);
+
+if (closeQ != std::wstring::npos)
+
+{
+
+size_t comma = iconStr.find(L',', closeQ);
+
+if (comma != std::wstring::npos) idx = _wtoi(iconStr.c_str() + comma + 1);
+
+iconStr = iconStr.substr(1, closeQ - 1);
+
+}
+
+}
+
+else
+
+{
+
+size_t comma = iconStr.rfind(L',');
+
+if (comma != std::wstring::npos)
+
+{
+
+idx = _wtoi(iconStr.c_str() + comma + 1);
+
+iconStr = iconStr.substr(0, comma);
+
+}
+
+while (!iconStr.empty() && (iconStr.back() == L',' || iconStr.back() == L' '))
+
+iconStr.pop_back();
+
+}
+
+StringCchCopyW(szIcon, ARRAYSIZE(szIcon), iconStr.c_str());
+
+
+
+// Try system image list first (highest quality)
+
+IImageList* pImgList = nullptr;
+
+if (SUCCEEDED(SHGetImageList(SHIL_LARGE, IID_PPV_ARGS(&pImgList))))
+
+{
+
+SHFILEINFOW sfi2 = {};
+
+SHGetFileInfoW(szIcon, 0, &sfi2, sizeof(sfi2), SHGFI_SYSICONINDEX | SHGFI_LARGEICON);
+
+if (sfi2.iIcon >= 0) pImgList->GetIcon(sfi2.iIcon, ILD_TRANSPARENT, &entry.hIcon);
+
+pImgList->Release();
+
+if (entry.hIcon) return true;
+
+}
+
+
+
+// Fallback: ExtractIconExW
+
+HICON hiconLarge = nullptr, hiconSmall = nullptr;
+
+UINT nIcons = ExtractIconExW(szIcon, idx, &hiconLarge, &hiconSmall, 1);
+
+if (nIcons == 0 && idx != 0)
+
+nIcons = ExtractIconExW(szIcon, 0, &hiconLarge, &hiconSmall, 1);
+
+
+
+if (!bSmall && hiconLarge)
+
+{
+
+entry.hIcon = hiconLarge;
+
+if (hiconSmall) DestroyIcon(hiconSmall);
+
+return true;
+
+}
+
+if (bSmall && hiconSmall)
+
+{
+
+entry.hIcon = hiconSmall;
+
+if (hiconLarge) DestroyIcon(hiconLarge);
+
+return true;
+
+}
+
+if (hiconLarge) DestroyIcon(hiconLarge);
+
+if (hiconSmall) DestroyIcon(hiconSmall);
+
+return false;
+
+}
+
+
+
+// ===========================================================================
+
+// Default handler persistence
+
+// ===========================================================================
+
+static std::wstring GetDefaultHandler(LPCWSTR pwszEvent)
+
+{
+
+WCHAR szKey[512] = {};
+
+StringCchPrintfW(szKey, ARRAYSIZE(szKey),
+
+L"%s\\UserChosenExecuteHandlers\\%s", REGPATH_DEFAULTS, pwszEvent);
+
+std::wstring result;
+
+HKEY hk = nullptr;
+
+if (RegOpenKeyExW(HKEY_CURRENT_USER, szKey, 0, KEY_READ, &hk) == ERROR_SUCCESS)
+
+{
+
+WCHAR val[256] = {};
+
+DWORD cb = sizeof(val);
+
+RegQueryValueExW(hk, L"", nullptr, nullptr, reinterpret_cast<LPBYTE>(val), &cb);
+
+result = val;
+
+RegCloseKey(hk);
+
+}
+
+return result;
+
+}
+
+
+
+static void SetDefaultHandler(LPCWSTR pwszEvent, LPCWSTR pwszID)
+
+{
+
+WCHAR szKey[512] = {};
+
+StringCchPrintfW(szKey, ARRAYSIZE(szKey),
+
+L"%s\\UserChosenExecuteHandlers\\%s", REGPATH_DEFAULTS, pwszEvent);
+
+HKEY hk = nullptr;
+
+if (RegCreateKeyExW(HKEY_CURRENT_USER, szKey, 0, nullptr,
+
+REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr) == ERROR_SUCCESS)
+
+{
+
+if (pwszID && pwszID[0])
+
+RegSetValueExW(hk, L"", 0, REG_SZ,
+
+reinterpret_cast<const BYTE*>(pwszID),
+
+static_cast<DWORD>((wcslen(pwszID) + 1) * sizeof(WCHAR)));
+
+else RegDeleteValueW(hk, L"");
+
+RegCloseKey(hk);
+
+}
+
+}
+
+
+
+static std::wstring GetEffectiveDefaultHandler(LPCWSTR pwszEvent)
+
+{
+
+std::wstring chosen = GetDefaultHandler(pwszEvent);
+
+if (!chosen.empty() && chosen != HANDLER_PROMPT_EACH) return chosen;
+
+
+
+WCHAR szKey[512] = {};
+
+StringCchPrintfW(szKey, ARRAYSIZE(szKey),
+
+L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\"
+
+L"AutoplayHandlers\\EventHandlers\\%s", pwszEvent);
+
+HKEY hk = nullptr;
+
+if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, szKey, 0, KEY_READ, &hk) == ERROR_SUCCESS)
+
+{
+
+WCHAR szVal[256] = {};
+
+DWORD cb = sizeof(szVal);
+
+RegQueryValueExW(hk, L"", nullptr, nullptr, reinterpret_cast<LPBYTE>(szVal), &cb);
+
+RegCloseKey(hk);
+
+if (szVal[0]) return szVal;
+
+}
+
+return chosen;
+
+}
+
+
+
+// ===========================================================================
+
+// Policy gate
+
+// ===========================================================================
+
+static bool AutoPlay_IsAllowedForDrive(LPCWSTR szRootPath)
+
+{
+
+if (!szRootPath || !szRootPath[0]) return false;
+
+
+
+// DisableAutoplay
+
+{
+
+DWORD val = 0; HKEY hk = nullptr;
+
+if (RegOpenKeyExW(HKEY_CURRENT_USER,
+
+L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers",
+
+0, KEY_READ, &hk) == ERROR_SUCCESS)
+
+{
+
+DWORD cb = sizeof(val);
+
+RegQueryValueExW(hk, L"DisableAutoplay", nullptr, nullptr,
+
+reinterpret_cast<LPBYTE>(&val), &cb);
+
+RegCloseKey(hk);
+
+}
+
+if (val) return false;
+
+}
+
+
+
+UINT driveType = GetDriveTypeW(szRootPath);
+
+
+
+// NoDriveTypeAutoRun
+
+{
+
+DWORD dwMask = 0x91; // Win7 default (unknown + no-root + network + ramdisk)
+
+for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
+
+{
+
+HKEY hk = nullptr;
+
+if (RegOpenKeyExW(root,
+
+L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer",
+
+0, KEY_READ, &hk) == ERROR_SUCCESS)
+
+{
+
+DWORD val = 0, cb = sizeof(val);
+
+if (RegQueryValueExW(hk, L"NoDriveTypeAutoRun", nullptr, nullptr,
+
+reinterpret_cast<LPBYTE>(&val), &cb) == ERROR_SUCCESS)
+
+dwMask = val;
+
+RegCloseKey(hk);
+
+}
+
+}
+
+if (dwMask & (1u << driveType)) return false;
+
+}
+
+
+
+// NoDriveAutoRun (per drive letter)
+
+if (szRootPath[1] == L':')
+
+{
+
+DWORD dwMask = 0;
+
+for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
+
+{
+
+HKEY hk = nullptr;
+
+if (RegOpenKeyExW(root,
+
+L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer",
+
+0, KEY_READ, &hk) == ERROR_SUCCESS)
+
+{
+
+DWORD val = 0, cb = sizeof(val);
+
+if (RegQueryValueExW(hk, L"NoDriveAutoRun", nullptr, nullptr,
+
+reinterpret_cast<LPBYTE>(&val), &cb) == ERROR_SUCCESS)
+
+dwMask = val;
+
+RegCloseKey(hk);
+
+}
+
+}
+
+if (dwMask)
+
+{
+
+int idx = towupper(szRootPath[0]) - L'A';
+
+if (idx >= 0 && idx <= 25 && (dwMask & (1u << idx))) return false;
+
+}
+
+}
+
+
+
+return true;
+
+}
+
+
+
+// ===========================================================================
+
+// IQueryCancelAutoPlay suppress Explorer's own AutoPlay toast
+
+// This class is registered in HKCU CancelAutoplay\CLSID so Explorer calls us.
+
+// We return S_FALSE (cancel) for any device we handle ourselves.
+
+// ===========================================================================
+
+
+
+// CLSID_PortableDeviceManager = {0F123780-ABD8-4D51-8480-00196BE4B10A}
+
+// Defined here because PortableDeviceGuids.lib is not available in Windhawk's compiler.
+
+DEFINE_GUID(CLSID_PortableDeviceManager,
+
+0x0F123780, 0xABD8, 0x4D51,
+
+0x84, 0x80, 0x00, 0x19, 0x6B, 0xE4, 0xB1, 0x0A);
+
+
+
+// {E1D8F3A2-4B9C-4D7E-A8F5-2C3B1E4D6F80}
+
+DEFINE_GUID(CLSID_Win7APCancelAutoPlay,
+
+0xE1D8F3A2, 0x4B9C, 0x4D7E,
+
+0xA8, 0xF5, 0x2C, 0x3B, 0x1E, 0x4D, 0x6F, 0x80);
+
+
+
+// Forward
+
+static void SpawnMTPDialog(const std::wstring& devId, const std::wstring& label);
+
+
+
+class CWin7APCancelAutoPlay : public IQueryCancelAutoPlay
+
+{
+
+public:
+
+ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+
+ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+
+{
+
+if (!ppv) return E_POINTER;
+
+*ppv = nullptr;
+
+if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IQueryCancelAutoPlay))
+
+{ *ppv = this; return S_OK; }
+
+return E_NOINTERFACE;
+
+}
+
+HRESULT STDMETHODCALLTYPE AllowAutoPlay(
+
+LPCWSTR /*pszPath*/, DWORD /*dwContentType*/,
+
+LPCWSTR /*pszLabel*/, DWORD /*dwSerialNumber*/) override
+
+{
+
+// S_FALSE = cancel Explorer's dialog (we show our own)
+
+return S_FALSE;
+
+}
+
+};
+
+
+
+static CWin7APCancelAutoPlay g_cancelAutoPlay;
+
+
+
+class CWin7APCancelAutoPlayFactory : public IClassFactory
+
+{
+
+public:
+
+ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+
+ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+
+{
+
+if (!ppv) return E_POINTER;
+
+*ppv = nullptr;
+
+if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IClassFactory))
+
+{ *ppv = this; return S_OK; }
+
+return E_NOINTERFACE;
+
+}
+
+HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) override
+
+{
+
+if (!ppv) return E_POINTER;
+
+*ppv = nullptr;
+
+if (pUnkOuter) return CLASS_E_NOAGGREGATION;
+
+return g_cancelAutoPlay.QueryInterface(riid, ppv);
+
+}
+
+HRESULT STDMETHODCALLTYPE LockServer(BOOL) override { return S_OK; }
+
+};
+
+
+
+static CWin7APCancelAutoPlayFactory g_cancelAutoPlayFactory;
+
+static DWORD g_dwCancelRegCookie = 0;
+
+
+
+static void RegisterCancelAutoPlay()
+
+{
+
+// Register COM class object
+
+CoRegisterClassObject(CLSID_Win7APCancelAutoPlay, &g_cancelAutoPlayFactory,
+
+CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE, &g_dwCancelRegCookie);
+
+
+
+// Write to CancelAutoplay\CLSID so shell calls us
+
+WCHAR szCLSID[64] = {};
+
+StringFromGUID2(CLSID_Win7APCancelAutoPlay, szCLSID, ARRAYSIZE(szCLSID));
+
+WCHAR szKey[512] = {};
+
+StringCchPrintfW(szKey, ARRAYSIZE(szKey),
+
+L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\"
+
+L"AutoplayHandlers\\CancelAutoplay\\CLSID");
+
+HKEY hk = nullptr;
+
+if (RegCreateKeyExW(HKEY_CURRENT_USER, szKey, 0, nullptr,
+
+REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr) == ERROR_SUCCESS)
+
+{
+
+RegSetValueExW(hk, szCLSID, 0, REG_SZ,
+
+reinterpret_cast<const BYTE*>(L""), sizeof(WCHAR));
+
+RegCloseKey(hk);
+
+}
+
+}
+
+
+
+static void UnregisterCancelAutoPlay()
+
+{
+
+if (g_dwCancelRegCookie)
+
+{
+
+CoRevokeClassObject(g_dwCancelRegCookie);
+
+g_dwCancelRegCookie = 0;
+
+}
+
+WCHAR szCLSID[64] = {};
+
+StringFromGUID2(CLSID_Win7APCancelAutoPlay, szCLSID, ARRAYSIZE(szCLSID));
+
+WCHAR szKey[512] = {};
+
+StringCchPrintfW(szKey, ARRAYSIZE(szKey),
+
+L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\"
+
+L"AutoplayHandlers\\CancelAutoplay\\CLSID");
+
+HKEY hk = nullptr;
+
+if (RegOpenKeyExW(HKEY_CURRENT_USER, szKey, 0, KEY_WRITE, &hk) == ERROR_SUCCESS)
+
+{
+
+RegDeleteValueW(hk, szCLSID);
+
+RegCloseKey(hk);
+
+}
+
+}
+
+
+
+// ===========================================================================
+
+// KnownDevices in-memory set, cleared on every mod load.
+
+// Prevents showing the dialog twice for the same device in one session,
+
+// but resets cleanly when the mod reloads so stale entries never block.
+
+// ===========================================================================
+
+static std::unordered_set<std::wstring> g_knownDevices;
+
+static CRITICAL_SECTION g_csKnownDevices;
+
+
+
+static std::wstring GetDeviceKey(LPCWSTR szDevicePath)
+
+{
+
+if (!szDevicePath || !szDevicePath[0]) return {};
+
+// For drive letters, use the volume GUID so the key survives drive-letter changes
+
+if (szDevicePath[1] == L':')
+
+{
+
+WCHAR szRoot[8] = {};
+
+StringCchPrintfW(szRoot, ARRAYSIZE(szRoot), L"%c:\\", szDevicePath[0]);
+
+WCHAR szGUID[MAX_PATH] = {};
+
+if (GetVolumeNameForVolumeMountPointW(szRoot, szGUID, ARRAYSIZE(szGUID)) && szGUID[0])
+
+return szGUID;
+
+}
+
+return szDevicePath;
+
+}
+
+
+
+static bool IsKnownDevice(LPCWSTR szDevicePath)
+
+{
+
+auto key = GetDeviceKey(szDevicePath);
+
+if (key.empty()) return false;
+
+EnterCriticalSection(&g_csKnownDevices);
+
+bool known = g_knownDevices.count(key) > 0;
+
+LeaveCriticalSection(&g_csKnownDevices);
+
+Wh_Log(L"[IsKnownDevice] %s -> %s", szDevicePath, known ? L"known" : L"new");
+
+return known;
+
+}
+
+
+
+static void RegisterKnownDevice(LPCWSTR szDevicePath)
+
+{
+
+auto key = GetDeviceKey(szDevicePath);
+
+if (key.empty()) return;
+
+EnterCriticalSection(&g_csKnownDevices);
+
+g_knownDevices.insert(key);
+
+LeaveCriticalSection(&g_csKnownDevices);
+
+Wh_Log(L"[RegisterKnownDevice] %s", szDevicePath);
+
+}
+
+
+
+static void UnregisterKnownDevice(LPCWSTR szDevicePath)
+
+{
+
+auto key = GetDeviceKey(szDevicePath);
+
+if (key.empty()) return;
+
+EnterCriticalSection(&g_csKnownDevices);
+
+g_knownDevices.erase(key);
+
+LeaveCriticalSection(&g_csKnownDevices);
+
+Wh_Log(L"[UnregisterKnownDevice] %s", szDevicePath);
+
+}
+
+
+
+// ===========================================================================
+
+// Handler invocation
+
+// ===========================================================================
+
+static void OpenControlPanelAutoPlay()
+
+{
+
+ShellExecuteW(nullptr, L"open", L"control.exe",
+
+L"/name Microsoft.AutoPlay", nullptr, SW_SHOWNORMAL);
+
+}
+
+
+
+static HRESULT InvokeHandler(const HandlerEntry& entry,
+
+LPCWSTR pwszDevicePath, HWND hwndOwner)
+
+{
+
+// Case 1: COM IHWEventHandler
+
+if (!IsEqualCLSID(entry.clsid, CLSID_NULL))
+
+{
+
+IHWEventHandler* pHW = nullptr;
+
+HRESULT hr = CoCreateInstance(entry.clsid, nullptr,
+
+CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+
+IID_IHWEventHandler, reinterpret_cast<void**>(&pHW));
+
+if (SUCCEEDED(hr) && pHW)
+
+{
+
+LPCWSTR pszInit = entry.initCmdLine.empty()
+
+? pwszDevicePath : entry.initCmdLine.c_str();
+
+hr = pHW->Initialize(pszInit);
+
+if (SUCCEEDED(hr))
+
+hr = pHW->HandleEvent(pwszDevicePath, pwszDevicePath,
+
+entry.eventHandler.empty() ? L"" : entry.eventHandler.c_str());
+
+pHW->Release();
+
+if (SUCCEEDED(hr)) return hr;
+
+}
+
+}
+
+
+
+// Case 2: Shell verb via ProgID
+
+if (!entry.progId.empty() && !entry.verb.empty())
+
+{
+
+auto extensions = GetExtensionsForEvent(entry.eventHandler);
+
+std::wstring targetPath = pwszDevicePath ? pwszDevicePath : L"";
+
+if (!extensions.empty())
+
+{
+
+auto files = ScanFilesForExtensions(pwszDevicePath, extensions);
+
+if (!files.empty()) targetPath = files[0];
+
+}
+
+IShellItem* psi = nullptr;
+
+if (SUCCEEDED(SHCreateItemFromParsingName(targetPath.c_str(), nullptr, IID_PPV_ARGS(&psi))))
+
+{
+
+IContextMenu* pcm = nullptr;
+
+if (SUCCEEDED(psi->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&pcm))))
+
+{
+
+char szVerb[64] = {};
+
+WideCharToMultiByte(CP_ACP, 0, entry.verb.c_str(), -1,
+
+szVerb, sizeof(szVerb), nullptr, nullptr);
+
+CMINVOKECOMMANDINFO ici = {};
+
+ici.cbSize = sizeof(ici);
+
+ici.hwnd = hwndOwner;
+
+ici.lpVerb = szVerb;
+
+ici.nShow = SW_SHOWNORMAL;
+
+HRESULT hr = pcm->InvokeCommand(&ici);
+
+pcm->Release(); psi->Release();
+
+if (SUCCEEDED(hr)) return hr;
+
+}
+
+else psi->Release();
+
+}
+
+SHELLEXECUTEINFOW sei = { sizeof(sei) };
+
+sei.fMask = SEE_MASK_CLASSNAME | SEE_MASK_FLAG_NO_UI;
+
+sei.hwnd = hwndOwner;
+
+sei.lpClass = entry.progId.c_str();
+
+sei.lpVerb = entry.verb.c_str();
+
+sei.lpFile = targetPath.c_str();
+
+sei.nShow = SW_SHOWNORMAL;
+
+if (ShellExecuteExW(&sei)) return S_OK;
+
+}
+
+
+
+// Case 3: Direct command
+
+if (!entry.command.empty())
+
+{
+
+std::wstring cmd = entry.command;
+
+std::wstring device = pwszDevicePath ? pwszDevicePath : L"";
+
+bool hasPlaceholder = (cmd.find(L"%1") != std::wstring::npos ||
+
+cmd.find(L"%L") != std::wstring::npos ||
+
+cmd.find(L"%V") != std::wstring::npos);
+
+
+
+auto replaceAll = [](std::wstring& str, const std::wstring& from, const std::wstring& to)
+
+{
+
+size_t pos = 0;
+
+while ((pos = str.find(from, pos)) != std::wstring::npos)
+
+{ str.replace(pos, from.size(), to); pos += to.size(); }
+
+};
+
+
+
+if (hasPlaceholder)
+
+{
+
+auto extensions = GetExtensionsForEvent(entry.eventHandler);
+
+if (!extensions.empty())
+
+{
+
+auto files = ScanFilesForExtensions(pwszDevicePath, extensions);
+
+if (!files.empty())
+
+{
+
+std::wstring firstFile = L"\"" + files[0] + L"\"";
+
+replaceAll(cmd, L"%1", firstFile);
+
+replaceAll(cmd, L"%L", firstFile);
+
+replaceAll(cmd, L"%V", firstFile);
+
+}
+
+else
+
+{
+
+replaceAll(cmd, L"%1", L"\"" + device + L"\"");
+
+replaceAll(cmd, L"%L", L"\"" + device + L"\"");
+
+replaceAll(cmd, L"%V", L"\"" + device + L"\"");
+
+}
+
+}
+
+else
+
+{
+
+replaceAll(cmd, L"%1", L"\"" + device + L"\"");
+
+replaceAll(cmd, L"%L", L"\"" + device + L"\"");
+
+replaceAll(cmd, L"%V", L"\"" + device + L"\"");
+
+}
+
+}
+
+
+
+SHELLEXECUTEINFOW sei = { sizeof(sei) };
+
+sei.fMask = SEE_MASK_FLAG_NO_UI;
+
+sei.hwnd = hwndOwner;
+
+sei.lpVerb = L"open";
+
+sei.lpFile = cmd.c_str();
+
+sei.nShow = SW_SHOWNORMAL;
+
+if (ShellExecuteExW(&sei)) return S_OK;
+
+ShellExecuteW(hwndOwner, L"open", cmd.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+
+return S_OK;
+
+}
+
+
+
+return E_FAIL;
+
+}
+
+
+
+// ===========================================================================
+
+// Win7 AutoPlay Dialog built as a Win32 dialog from a runtime template
+
+// (Windhawk mods can't have resource files, so we build the DLGTEMPLATE
+
+// programmatically and use an in-memory dialog.)
+
+// ===========================================================================
+
+
+
+// Helper: align to DWORD
+
+static void* AlignPtr(void* p) {
+
+uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+
+if (addr & 3) addr = (addr + 3) & ~3;
+
+return reinterpret_cast<void*>(addr);
+
+}
+
+
+
+// Build a DLGTEMPLATE in heap memory that matches the Win7 shell32 dialog 1121.
+
+// Returns the buffer (caller must HeapFree) and its size.
+
+static DLGTEMPLATE* BuildDialogTemplate(DWORD& outSize)
+
+{
+
+// We'll build the template into a fixed-size buffer.
+
+// Win7 dialog: 212 x 300 DLUs, 10 controls.
+
+const size_t BUF = 8192;
+
+BYTE* buf = reinterpret_cast<BYTE*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, BUF));
+
+if (!buf) return nullptr;
+
+
+
+BYTE* p = buf;
+
+
+
+// DLGTEMPLATEEX (extended dialog)
+
+auto WriteWord = [&](WORD w) { *reinterpret_cast<WORD*>(p) = w; p += 2; };
+
+auto WriteDword = [&](DWORD dw) { *reinterpret_cast<DWORD*>(p) = dw; p += 4; };
+
+auto WriteWStr = [&](LPCWSTR s) {
+
+while (*s) { WriteWord((WORD)*s++); }
+
+WriteWord(0);
+
+};
+
+auto Align = [&]() {
+
+while ((p - buf) & 3) { *p++ = 0; }
+
+};
+
+
+
+// DLGTEMPLATEEX header
+
+WriteWord(1); // dlgVer
+
+WriteWord(0xFFFF); // signature
+
+WriteDword(0); // helpID
+
+WriteDword(0); // exStyle
+
+WriteDword(DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_MINIMIZEBOX |
+
+WS_POPUP | WS_CLIPSIBLINGS | WS_CAPTION | WS_SYSMENU); // style matches RC
+
+WriteWord(10); // cDlgItems
+
+WriteWord(0); // x
+
+WriteWord(0); // y
+
+WriteWord(212); // cx (dialog units)
+
+WriteWord(300); // cy
+
+WriteWord(0); // menu (none)
+
+WriteWord(0); // windowClass (none)
+
+WriteWStr(L"AutoPlay"); // title
+
+// DS_SHELLFONT font info
+
+WriteWord(8); // pointsize
+
+WriteWord(400); // weight (FW_NORMAL)
+
+*p++ = 0; // bItalic
+
+*p++ = 0; // charset ANSI_CHARSET = 0 (DEFAULT_CHARSET per DLGTEMPLATEEX)
+
+WriteWStr(L"MS Shell Dlg");
+
+Align();
+
+
+
+// Helper to write a DLGITEMTEMPLATEEX
+
+auto WriteControl = [&](DWORD exStyle, DWORD style,
+
+short x, short y, short cx, short cy,
+
+DWORD id, LPCWSTR cls, LPCWSTR title)
+
+{
+
+Align();
+
+WriteDword(0); // helpID
+
+WriteDword(exStyle); // exStyle
+
+WriteDword(style); // style
+
+WriteWord((WORD)x); WriteWord((WORD)y);
+
+WriteWord((WORD)cx); WriteWord((WORD)cy);
+
+WriteDword(id); // id (32-bit in ex)
+
+// windowClass as atom (0xFFFF + atom) or string
+
+WriteWStr(cls);
+
+WriteWStr(title);
+
+WriteWord(0); // extraCount
+
+};
+
+
+
+const DWORD WC = WS_CHILD;
+
+
+
+// 1. Device icon (SS_ICON static)
+
+WriteControl(0, WC | WS_VISIBLE | SS_ICON,
+
+12, 12, 20, 20, IDC_AUTOPLAY_ICON, L"STATIC", L"");
+
+
+
+// 2. Title label
+
+WriteControl(0, WC | WS_VISIBLE | WS_GROUP | SS_LEFT,
+
+36, 8, 164, 28, IDC_AUTOPLAY_TITLE, L"STATIC", L"AutoPlay");
+
+
+
+// 3. "Searching..." label visible initially (RC: WS_VISIBLE)
+
+WriteControl(0, WC | WS_VISIBLE | WS_GROUP | SS_LEFT,
+
+36, 10, 164, 14, IDC_AUTOPLAY_SEARCHING, L"STATIC", L"Searching for content...");
+
+
+
+// 4. Progress bar visible initially (RC: WS_VISIBLE)
+
+WriteControl(0, WC | WS_VISIBLE,
+
+36, 26, 164, 8, IDC_AUTOPLAY_PROGRESS, L"msctls_progress32", L"");
+
+
+
+// 5. Default action message (initially hidden)
+
+WriteControl(0, WC | WS_GROUP | SS_LEFT,
+
+12, 38, 188, 18, IDC_AUTOPLAY_DEFAULT_MSG, L"STATIC",
+
+L"Your default action will occur or other options will become available.");
+
+
+
+// 6. New handler message (initially hidden)
+
+WriteControl(0, WC | WS_GROUP | SS_LEFT,
+
+12, 38, 188, 42, IDC_AUTOPLAY_NEWHANDLER, L"STATIC",
+
+L"New options are available. You can keep the current default or choose a new default below.");
+
+
+
+// 7. "Always do this" checkbox (initially hidden)
+
+WriteControl(0, WC | WS_TABSTOP | BS_AUTOCHECKBOX | BS_MULTILINE,
+
+12, 38, 188, 18, IDC_AUTOPLAY_ALWAYSDO, L"BUTTON",
+
+L"Always do this for this device:");
+
+
+
+// 8. Invisible accessibility label
+
+WriteControl(0, WC | WS_GROUP | SS_LEFT,
+
+0, 0, 0, 0, 0xFFFF, L"STATIC", L"AutoPlay options");
+
+
+
+// 9. ListView
+
+// ListView exact match to RC (no LVS_AUTOARRANGE, no WS_EX_CLIENTEDGE in RC)
+
+WriteControl(0,
+
+WC | WS_VISIBLE | WS_TABSTOP |
+
+LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS |
+
+LVS_SHAREIMAGELISTS | LVS_NOCOLUMNHEADER | LVS_NOSORTHEADER,
+
+12, 60, 188, 218, IDC_AUTOPLAY_LIST, L"SysListView32", L"");
+
+
+
+// 10. SysLink for Control Panel
+
+WriteControl(0, WC | WS_VISIBLE | WS_TABSTOP,
+
+12, 282, 188, 10, IDC_AUTOPLAY_CPLLINK, L"SysLink",
+
+L"<A>View more AutoPlay options in Control Panel</A>");
+
+
+
+Align();
+
+outSize = static_cast<DWORD>(p - buf);
+
+return reinterpret_cast<DLGTEMPLATE*>(buf);
+
+}
+
+
+
+// ===========================================================================
+
+// CAutoplayDialog class
+
+// ===========================================================================
+
+enum class APState { Searching, Chooser };
+
+struct ListItemData { std::shared_ptr<HandlerEntry> entry; };
+
+
+
+static const struct ContentTypeInfo
+
+{
+
+DWORD flag;
+
+LPCWSTR eventHandler;
+
+UINT headerStringID;
+
+} g_ct[] = {
+
+{ AUTOPLAY_CONTENT_AUTORUN, L"HandleAutorunOnArrival", IDS_INSTALL_OR_RUN },
+
+{ AUTOPLAY_CONTENT_MUSIC, L"PlayMusicFilesOnArrival", IDS_AUDIO_OPTIONS },
+
+{ AUTOPLAY_CONTENT_PICTURES, L"ShowPicturesOnArrival", IDS_PICTURE_OPTIONS },
+
+{ AUTOPLAY_CONTENT_VIDEO, L"PlayVideoFilesOnArrival", IDS_VIDEO_OPTIONS },
+
+{ AUTOPLAY_CONTENT_BLANK_CD, L"HandleCDBurningOnArrival", IDS_BLANK_CD_OPTIONS },
+
+{ AUTOPLAY_CONTENT_BLANK_DVD, L"HandleDVDBurningOnArrival", IDS_BLANK_DVD_OPTIONS},
+
+{ AUTOPLAY_CONTENT_MIX, L"MixedContentOnArrival", IDS_MIXED_OPTIONS },
+
+{ AUTOPLAY_CONTENT_OPENCPANEL,L"UnknownContentOnArrival", IDS_GENERAL_OPTIONS },
+
+};
+
+static const int g_nCt = (int)(sizeof(g_ct) / sizeof(g_ct[0]));
+
+
+
+class CAutoplayDialog
+
+{
+
+public:
+
+std::wstring m_devicePath, m_volumeLabel, m_iconLocation, m_eventHandler;
+
+int m_listOrigW = 0;
+
+DWORD m_contentFlags = 0;
+
+bool m_isVolume = false;
+
+bool m_forDevice = false;
+
+
+
+private:
+
+HWND m_hwnd = nullptr;
+
+HWND m_hwndList = nullptr;
+
+APState m_state = APState::Searching;
+
+std::wstring m_defaultHandlerID;
+
+std::vector<ListItemData> m_items;
+
+int m_groupId = 0;
+
+HTHEME m_hTheme = nullptr;
+
+HFONT m_hfList = nullptr;
+
+HBRUSH m_hbrBg = nullptr;
+
+HFONT m_hfTitle = nullptr;
+
+HFONT m_hfBody = nullptr;
+
+COLORREF m_clrTitle = 0;
+
+COLORREF m_clrBody = 0;
+
+HICON m_hiconDevice = nullptr;
+
+bool m_bAlwaysDo = false;
+
+bool m_bOwnIcon = false;
+
+HANDLE m_hReady = nullptr;
+
+
+
+public:
+
+~CAutoplayDialog()
+
+{
+
+FreeTheme();
+
+if (m_hiconDevice && m_bOwnIcon) DestroyIcon(m_hiconDevice);
+
+if (m_hReady) CloseHandle(m_hReady);
+
+}
+
+
+
+void Show(HWND hwndParent)
+
+{
+
+m_hReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+DWORD tmplSize = 0;
+
+DLGTEMPLATE* tmpl = BuildDialogTemplate(tmplSize);
+
+if (!tmpl)
+
+{
+
+Wh_Log(L"Failed to build dialog template");
+
+return;
+
+}
+
+Wh_Log(L"[Show] Calling DialogBoxIndirectParamW, tmplSize=%lu", tmplSize);
+
+INT_PTR r = DialogBoxIndirectParamW(g_hInstance, tmpl, hwndParent,
+
+DlgProcStatic, reinterpret_cast<LPARAM>(this));
+
+DWORD err = GetLastError();
+
+HeapFree(GetProcessHeap(), 0, tmpl);
+
+Wh_Log(L"[Show] DialogBoxIndirectParamW returned %lld (err=%lu)", (long long)r, err);
+
+if (r == -1)
+
+Wh_Log(L"[Show] Hard failure creating dialog");
+
+}
+
+
+
+static INT_PTR CALLBACK DlgProcStatic(HWND h, UINT m, WPARAM w, LPARAM l)
+
+{
+
+CAutoplayDialog* p = nullptr;
+
+if (m == WM_INITDIALOG)
+
+{
+
+p = reinterpret_cast<CAutoplayDialog*>(l);
+
+Wh_Log(L"[DlgProc] WM_INITDIALOG hwnd=%p p=%p", h, p);
+
+SetWindowLongPtrW(h, DWLP_USER, reinterpret_cast<LONG_PTR>(p));
+
+p->m_hwnd = h;
+
+}
+
+else p = reinterpret_cast<CAutoplayDialog*>(GetWindowLongPtrW(h, DWLP_USER));
+
+return p ? p->Proc(h, m, w, l) : FALSE;
+
+}
+
+
+
+private:
+
+INT_PTR Proc(HWND h, UINT msg, WPARAM w, LPARAM l)
+
+{
+
+switch (msg)
+
+{
+
+case WM_INITDIALOG: return Init();
+
+
+
+case WM_COMMAND:
+
+if (LOWORD(w) == IDOK) { OnOK(); return TRUE; }
+
+if (LOWORD(w) == IDCANCEL) { EndDialog(h, IDCANCEL); return TRUE; }
+
+if (LOWORD(w) == IDC_AUTOPLAY_ALWAYSDO && HIWORD(w) == BN_CLICKED)
+
+{
+
+m_bAlwaysDo = (SendDlgItemMessageW(h, IDC_AUTOPLAY_ALWAYSDO,
+
+BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+return TRUE;
+
+}
+
+break;
+
+
+
+case WM_NOTIFY:
+
+{
+
+auto* nm = reinterpret_cast<NMHDR*>(l);
+
+if (nm->idFrom == IDC_AUTOPLAY_LIST)
+
+{
+
+if (nm->code == NM_CUSTOMDRAW)
+
+{
+
+LRESULT lr = CustomDraw(reinterpret_cast<NMLVCUSTOMDRAW*>(l));
+
+SetWindowLongPtrW(m_hwnd, DWLP_MSGRESULT, lr);
+
+return TRUE;
+
+}
+
+if (nm->code == NM_DBLCLK || nm->code == LVN_ITEMACTIVATE)
+
+{ OnOK(); return TRUE; }
+
+}
+
+else if (nm->idFrom == IDC_AUTOPLAY_CPLLINK &&
+
+(nm->code == NM_CLICK || nm->code == NM_RETURN))
+
+OpenControlPanelAutoPlay();
+
+break;
+
+}
+
+
+
+case WM_CTLCOLORSTATIC:
+
+return ColorStatic(reinterpret_cast<HDC>(w), reinterpret_cast<HWND>(l));
+
+
+
+case WM_ERASEBKGND:
+
+if (m_hbrBg)
+
+{
+
+RECT r2; GetClientRect(h, &r2);
+
+FillRect((HDC)w, &r2, m_hbrBg);
+
+return TRUE;
+
+}
+
+break;
+
+
+
+case WM_CTLCOLORBTN:
+
+{
+
+HWND hwndCtl = reinterpret_cast<HWND>(l);
+
+if (GetDlgCtrlID(hwndCtl) == IDC_AUTOPLAY_ALWAYSDO)
+
+{
+
+HDC hdc = reinterpret_cast<HDC>(w);
+
+SetBkMode(hdc, TRANSPARENT);
+
+if (m_hbrBg) return reinterpret_cast<INT_PTR>(m_hbrBg);
+
+}
+
+break;
+
+}
+
+
+
+case WM_DESTROY:
+
+if (m_forDevice && !m_devicePath.empty())
+
+UnregisterMTPDialog(m_devicePath);
+
+else if (!m_devicePath.empty() && m_devicePath.size() <= 3 && m_devicePath[1] == L':')
+
+{
+
+WCHAR letter = towupper(m_devicePath[0]);
+
+UnregisterVolDialog(letter);
+
+}
+
+FreeTheme();
+
+ClearList();
+
+break;
+
+
+
+case WM_TIMER:
+
+if (w == 1) { KillTimer(h, 1); if (m_state == APState::Searching) GoChooser(); }
+
+break;
+
+
+
+case WM_CLOSE:
+
+EndDialog(h, IDCANCEL);
+
+return TRUE;
+
+
+
+case WM_AUTOPLAY_NEWCONTENT: m_contentFlags |= (DWORD)l; return TRUE;
+
+case WM_AUTOPLAY_SNIFFCOMPLETE:
+
+KillTimer(h, 1);
+
+m_contentFlags = (DWORD)l;
+
+GoChooser();
+
+return TRUE;
+
+}
+
+return FALSE;
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// CustomDraw
+
+// -----------------------------------------------------------------------
+
+LRESULT CustomDraw(NMLVCUSTOMDRAW* pcd)
+
+{
+
+switch (pcd->nmcd.dwDrawStage)
+
+{
+
+case CDDS_PREPAINT: return CDRF_NOTIFYITEMDRAW;
+
+case CDDS_ITEMPREPAINT:
+
+{
+
+int idx = (int)pcd->nmcd.dwItemSpec;
+
+if (idx < 0 || idx >= (int)m_items.size()) return CDRF_DODEFAULT;
+
+
+
+HDC hdc = pcd->nmcd.hdc;
+
+RECT rc = {};
+
+ListView_GetItemRect(m_hwndList, idx, &rc, LVIR_BOUNDS);
+
+RECT rcClient; GetClientRect(m_hwndList, &rcClient);
+
+rc.right = rcClient.right;
+
+
+
+bool bSel = (ListView_GetItemState(m_hwndList, idx, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+
+bool bHot = (ListView_GetHotItem(m_hwndList) == idx);
+
+bool bThemed = IsAppThemed() && IsThemeActive();
+
+
+
+// Background
+
+if (bSel || bHot)
+
+{
+
+if (bThemed)
+
+{
+
+HTHEME hTh = OpenThemeData(m_hwndList, L"ListView");
+
+if (hTh)
+
+{
+
+DrawThemeBackground(hTh, hdc, LVP_LISTITEM,
+
+bSel ? LISS_SELECTED : LISS_HOT, &rc, nullptr);
+
+CloseThemeData(hTh);
+
+}
+
+else
+
+{
+
+HBRUSH hbr = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
+
+FillRect(hdc, &rc, hbr); DeleteObject(hbr);
+
+}
+
+}
+
+else
+
+{
+
+HBRUSH hbr = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
+
+FillRect(hdc, &rc, hbr); DeleteObject(hbr);
+
+if (bSel)
+
+{
+
+HBRUSH hbrFrame = (HBRUSH)GetStockObject(NULL_BRUSH);
+
+HBRUSH hbrOld = (HBRUSH)SelectObject(hdc, hbrFrame);
+
+HPEN hpen = CreatePen(PS_DOT, 1, GetSysColor(COLOR_HIGHLIGHTTEXT));
+
+HPEN hpenOld = (HPEN)SelectObject(hdc, hpen);
+
+SetBkColor(hdc, GetSysColor(COLOR_HIGHLIGHT));
+
+Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+
+SelectObject(hdc, hpenOld); DeleteObject(hpen);
+
+SelectObject(hdc, hbrOld);
+
+}
+
+}
+
+}
+
+else
+
+{
+
+HBRUSH hbr = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
+
+FillRect(hdc, &rc, hbr); DeleteObject(hbr);
+
+}
+
+SetBkMode(hdc, TRANSPARENT);
+
+
+
+const HandlerEntry* e = m_items[idx].entry.get();
+
+if (!e) return CDRF_SKIPDEFAULT;
+
+
+
+int rowH = rc.bottom - rc.top;
+
+int midY = rc.top + rowH / 2;
+
+
+
+if (e->hIcon)
+
+DrawIconEx(hdc, rc.left + 4, rc.top + (rowH - 32) / 2,
+
+e->hIcon, 32, 32, 0, nullptr, DI_NORMAL);
+
+
+
+int textLeft = e->hIcon ? rc.left + 44 : rc.left + 6;
+
+
+
+// Text colours
+
+COLORREF clrAction, clrProvider;
+
+if (bSel)
+
+{
+
+clrAction = GetSysColor(COLOR_HIGHLIGHTTEXT);
+
+if (bThemed)
+
+{
+
+HTHEME hTh = OpenThemeData(m_hwndList, L"ListView");
+
+if (hTh)
+
+{
+
+GetThemeColor(hTh, LVP_LISTITEM, LISS_SELECTED, TMT_TEXTCOLOR, &clrAction);
+
+CloseThemeData(hTh);
+
+}
+
+}
+
+clrProvider = clrAction;
+
+}
+
+else
+
+{
+
+clrAction = GetSysColor(COLOR_WINDOWTEXT);
+
+clrProvider = GetSysColor(COLOR_GRAYTEXT);
+
+}
+
+
+
+LOGFONTW lf = {};
+
+lf.lfHeight = -MulDiv(8, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+
+lf.lfWeight = FW_NORMAL;
+
+lf.lfUnderline = (bThemed && (bSel || bHot)) ? TRUE : FALSE;
+
+lf.lfCharSet = DEFAULT_CHARSET;
+
+lf.lfQuality = bThemed ? CLEARTYPE_QUALITY : DEFAULT_QUALITY;
+
+lf.lfPitchAndFamily = DEFAULT_PITCH | FF_SWISS;
+
+StringCchCopyW(lf.lfFaceName, LF_FACESIZE, L"Tahoma");
+
+
+
+HFONT hfN = CreateFontIndirectW(&lf);
+
+HFONT hfO = (HFONT)SelectObject(hdc, hfN);
+
+SetTextColor(hdc, clrAction);
+
+RECT rcA = { textLeft, rc.top + 2, rc.right - 4, midY };
+
+DrawTextW(hdc, e->action.c_str(), -1, &rcA,
+
+DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+SelectObject(hdc, hfO); DeleteObject(hfN);
+
+
+
+if (!e->provider.empty())
+
+{
+
+HFONT hfP = CreateFontIndirectW(&lf);
+
+hfO = (HFONT)SelectObject(hdc, hfP);
+
+SetTextColor(hdc, clrProvider);
+
+RECT rcP = { textLeft, midY, rc.right - 4, rc.bottom - 2 };
+
+DrawTextW(hdc, e->provider.c_str(), -1, &rcP,
+
+DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+SelectObject(hdc, hfO); DeleteObject(hfP);
+
+}
+
+return CDRF_SKIPDEFAULT;
+
+}
+
+}
+
+return CDRF_DODEFAULT;
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// Init
+
+// -----------------------------------------------------------------------
+
+INT_PTR Init()
+
+{
+
+m_hwndList = GetDlgItem(m_hwnd, IDC_AUTOPLAY_LIST);
+
+ApplyTheme();
+
+LoadDeviceIcon();
+
+InitLV();
+
+
+
+SetDlgItemTextW(m_hwnd, IDC_AUTOPLAY_SEARCHING, GetStr(IDS_SEARCHING));
+
+SetDlgItemTextW(m_hwnd, IDC_AUTOPLAY_DEFAULT_MSG, GetStr(IDS_DEFAULT_ACTION_MSG));
+
+SetDlgItemTextW(m_hwnd, IDC_AUTOPLAY_NEWHANDLER, GetStr(IDS_NEW_OPTIONS_MSG));
+
+SetDlgItemTextW(m_hwnd, IDC_AUTOPLAY_CPLLINK, GetStr(IDS_CPLLINK_TEXT));
+
+
+
+HWND hLink = GetDlgItem(m_hwnd, IDC_AUTOPLAY_CPLLINK);
+
+if (hLink) SetWindowTheme(hLink, L"Explorer", nullptr);
+
+SetWindowTheme(GetDlgItem(m_hwnd, IDC_AUTOPLAY_ALWAYSDO), L"Button", nullptr);
+
+SetWindowTheme(GetDlgItem(m_hwnd, IDC_AUTOPLAY_PROGRESS), L"Explorer", nullptr);
+
+
+
+Vis(IDC_AUTOPLAY_ALWAYSDO, false);
+
+SetWindowTextW(m_hwnd, GetStr(IDS_AUTOPLAY_TITLE));
+
+SetDlgItemTextW(m_hwnd, IDC_AUTOPLAY_TITLE,
+
+m_volumeLabel.empty() ? GetStr(IDS_AUTOPLAY_TITLE) : m_volumeLabel.c_str());
+
+
+
+// Register in tracking map
+
+if (m_forDevice && !m_devicePath.empty())
+
+RegisterMTPDialog(m_devicePath, m_hwnd);
+
+else if (!m_devicePath.empty() && m_devicePath.size() <= 3 && m_devicePath[1] == L':')
+
+RegisterVolDialog(towupper(m_devicePath[0]), m_hwnd);
+
+
+
+if (!m_eventHandler.empty())
+
+m_defaultHandlerID = GetEffectiveDefaultHandler(m_eventHandler.c_str());
+
+
+
+if (m_contentFlags != 0) GoChooser();
+
+else if (m_isVolume) { GoSearching(); Sniff(); }
+
+else GoChooser();
+
+
+
+if (m_hReady) SetEvent(m_hReady);
+
+return TRUE;
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// OnOK
+
+// -----------------------------------------------------------------------
+
+void OnOK()
+
+{
+
+int i = ListView_GetNextItem(m_hwndList, -1, LVNI_SELECTED);
+
+if (i < 0 || i >= (int)m_items.size()) { EndDialog(m_hwnd, IDCANCEL); return; }
+
+auto* e = m_items[i].entry.get();
+
+if (!e) { EndDialog(m_hwnd, IDCANCEL); return; }
+
+
+
+if (e->id == HANDLER_TAKE_NO_ACTION)
+
+{
+
+if (m_bAlwaysDo && !m_eventHandler.empty())
+
+SetDefaultHandler(m_eventHandler.c_str(), HANDLER_TAKE_NO_ACTION);
+
+EndDialog(m_hwnd, IDCANCEL); return;
+
+}
+
+if (e->id == HANDLER_OPEN_FOLDER)
+
+{
+
+ShellExecuteW(m_hwnd, L"open", m_devicePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+
+if (m_bAlwaysDo && !m_eventHandler.empty())
+
+SetDefaultHandler(m_eventHandler.c_str(), HANDLER_OPEN_FOLDER);
+
+EndDialog(m_hwnd, IDOK); return;
+
+}
+
+if (e->id == L"MSAutoRun")
+
+{
+
+WCHAR szInf[MAX_PATH] = {}, szOpen[MAX_PATH] = {};
+
+StringCchPrintfW(szInf, ARRAYSIZE(szInf), L"%sautorun.inf", m_devicePath.c_str());
+
+GetPrivateProfileStringW(L"AutoRun.Amd64", L"open", L"", szOpen, ARRAYSIZE(szOpen), szInf);
+
+if (!szOpen[0]) GetPrivateProfileStringW(L"AutoRun", L"open", L"", szOpen, ARRAYSIZE(szOpen), szInf);
+
+if (szOpen[0])
+
+{
+
+WCHAR szExeFull[MAX_PATH] = {};
+
+StringCchPrintfW(szExeFull, ARRAYSIZE(szExeFull), L"%s%s", m_devicePath.c_str(), szOpen);
+
+SHELLEXECUTEINFOW sei = { sizeof(sei) };
+
+sei.fMask = SEE_MASK_FLAG_NO_UI; sei.hwnd = m_hwnd;
+
+sei.lpVerb = L"open"; sei.lpFile = szExeFull; sei.nShow = SW_SHOWNORMAL;
+
+ShellExecuteExW(&sei);
+
+}
+
+if (m_bAlwaysDo && !m_eventHandler.empty())
+
+SetDefaultHandler(m_eventHandler.c_str(), e->id.c_str());
+
+EndDialog(m_hwnd, IDOK); return;
+
+}
+
+if (e->id == L"MSWPDShellNamespaceHandler")
+
+{
+
+static const CLSID CLSID_WPDShell =
+
+{ 0xA55803CC, 0x4D53, 0x404c, {0x85,0x57,0xFD,0x63,0xDB,0xA9,0x5D,0x24} };
+
+IHWEventHandler* pHW = nullptr;
+
+if (SUCCEEDED(CoCreateInstance(CLSID_WPDShell, nullptr,
+
+CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+
+IID_IHWEventHandler, reinterpret_cast<void**>(&pHW))) && pHW)
+
+{
+
+if (SUCCEEDED(pHW->Initialize(m_devicePath.c_str())))
+
+pHW->HandleEvent(m_devicePath.c_str(), m_devicePath.c_str(),
+
+m_eventHandler.c_str());
+
+pHW->Release();
+
+}
+
+if (m_bAlwaysDo && !m_eventHandler.empty())
+
+SetDefaultHandler(m_eventHandler.c_str(), e->id.c_str());
+
+EndDialog(m_hwnd, IDOK); return;
+
+}
+
+if (m_bAlwaysDo && !m_eventHandler.empty())
+
+SetDefaultHandler(m_eventHandler.c_str(), e->id.c_str());
+
+ShowWindow(m_hwnd, SW_HIDE);
+
+InvokeHandler(*e, m_devicePath.c_str(), nullptr);
+
+EndDialog(m_hwnd, IDOK);
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// GoSearching / GoChooser
+
+// -----------------------------------------------------------------------
+
+void GoSearching()
+
+{
+
+m_state = APState::Searching;
+
+Vis(IDC_AUTOPLAY_NEWHANDLER, false); Vis(IDC_AUTOPLAY_LIST, false);
+
+Vis(IDC_AUTOPLAY_SEARCHING, true); Vis(IDC_AUTOPLAY_PROGRESS, true);
+
+Vis(IDC_AUTOPLAY_DEFAULT_MSG, true); Vis(IDC_AUTOPLAY_TITLE, true);
+
+Vis(IDC_AUTOPLAY_ALWAYSDO, true); Vis(IDC_AUTOPLAY_CPLLINK, true);
+
+
+
+HWND hp = GetDlgItem(m_hwnd, IDC_AUTOPLAY_PROGRESS);
+
+SetWindowTheme(hp, L"Explorer", nullptr);
+
+SetWindowLongPtrW(hp, GWL_STYLE, GetWindowLongPtrW(hp, GWL_STYLE) | PBS_MARQUEE);
+
+SendMessageW(hp, PBM_SETMARQUEE, TRUE, 30);
+
+
+
+HWND hChk = GetDlgItem(m_hwnd, IDC_AUTOPLAY_ALWAYSDO);
+
+SetWindowTheme(hChk, L"Explorer", nullptr);
+
+EnableWindow(hChk, FALSE);
+
+SendMessageW(hChk, BM_SETCHECK, BST_UNCHECKED, 0);
+
+SetDlgItemTextW(m_hwnd, IDC_AUTOPLAY_ALWAYSDO, GetStr(IDS_ALWAYS_DO_DEVICE));
+
+
+
+ShowWindow(m_hwnd, SW_SHOW);
+
+SetForegroundWindow(m_hwnd);
+
+SetTimer(m_hwnd, 1, 5000, nullptr);
+
+}
+
+
+
+void GoChooser()
+
+{
+
+m_state = APState::Chooser;
+
+Vis(IDC_AUTOPLAY_SEARCHING, false); Vis(IDC_AUTOPLAY_PROGRESS, false);
+
+Vis(IDC_AUTOPLAY_DEFAULT_MSG, false); Vis(IDC_AUTOPLAY_NEWHANDLER, false);
+
+Vis(IDC_AUTOPLAY_TITLE, true); Vis(IDC_AUTOPLAY_CPLLINK, true);
+
+
+
+Populate();
+
+Vis(IDC_AUTOPLAY_LIST, true);
+
+
+
+int nContentTypes = 0;
+
+DWORD t2 = m_contentFlags & (AUTOPLAY_CONTENT_MUSIC | AUTOPLAY_CONTENT_PICTURES |
+
+AUTOPLAY_CONTENT_VIDEO | AUTOPLAY_CONTENT_AUTORUN);
+
+while (t2) { nContentTypes += (t2 & 1); t2 >>= 1; }
+
+bool bMixed = (nContentTypes > 1);
+
+bool bIsFixed = false;
+
+if (!m_devicePath.empty())
+
+bIsFixed = (GetDriveTypeW(m_devicePath.c_str()) == DRIVE_FIXED);
+
+
+
+std::wstring chkText = LoadStr(IDS_ALWAYS_DO_DEVICE);
+
+bool showChk = true;
+
+if (bMixed) showChk = false;
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_AUTORUN) chkText = LoadStr(IDS_ALWAYS_DO_AUTORUN);
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_MUSIC) chkText = LoadStr(IDS_ALWAYS_DO_MUSIC);
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_PICTURES) chkText = LoadStr(IDS_ALWAYS_DO_PICTURES);
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_VIDEO) chkText = LoadStr(IDS_ALWAYS_DO_VIDEO);
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_BLANK_CD) chkText = LoadStr(IDS_ALWAYS_DO_BLANK_CD);
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_BLANK_DVD) chkText = LoadStr(IDS_ALWAYS_DO_BLANK_DVD);
+
+else showChk = false;
+
+
+
+SetDlgItemTextW(m_hwnd, IDC_AUTOPLAY_ALWAYSDO, chkText.c_str());
+
+HWND hChk = GetDlgItem(m_hwnd, IDC_AUTOPLAY_ALWAYSDO);
+
+if (showChk && !bIsFixed)
+
+{
+
+bool bChk = !m_defaultHandlerID.empty() &&
+
+m_defaultHandlerID != HANDLER_PROMPT_EACH &&
+
+m_defaultHandlerID != HANDLER_TAKE_NO_ACTION;
+
+SetWindowTheme(hChk, L"Button", nullptr);
+
+ShowWindow(hChk, SW_SHOW);
+
+EnableWindow(hChk, TRUE);
+
+SendMessageW(hChk, BM_SETCHECK, bChk ? BST_CHECKED : BST_UNCHECKED, 0);
+
+m_bAlwaysDo = bChk;
+
+}
+
+else { ShowWindow(hChk, SW_HIDE); m_bAlwaysDo = false; }
+
+
+
+Select(m_defaultHandlerID.empty() ? nullptr : m_defaultHandlerID.c_str());
+
+Resize(showChk);
+
+ShowWindow(m_hwnd, SW_SHOW);
+
+SetForegroundWindow(m_hwnd);
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// Populate
+
+// -----------------------------------------------------------------------
+
+void Populate()
+
+{
+
+SendMessageW(m_hwndList, WM_SETREDRAW, FALSE, 0);
+
+ClearList();
+
+bool addedAnyGroup = false;
+
+
+
+int nContentTypes = 0;
+
+DWORD t2 = m_contentFlags & (AUTOPLAY_CONTENT_MUSIC | AUTOPLAY_CONTENT_PICTURES |
+
+AUTOPLAY_CONTENT_VIDEO | AUTOPLAY_CONTENT_AUTORUN);
+
+while (t2) { nContentTypes += (t2 & 1); t2 >>= 1; }
+
+bool bMixed = (nContentTypes > 1);
+
+
+
+std::vector<std::pair<std::wstring, std::wstring>> groups;
+
+std::vector<std::wstring> usedKeys;
+
+
+
+if (m_forDevice)
+
+{
+
+// MTP/WPD device: interface path, not a drive letter
+
+bool isMTPPath = m_devicePath.size() > 3 && m_devicePath[1] != L':';
+
+if (isMTPPath)
+
+{
+
+AddGroup(GetStr(IDS_GROUP_DEVICE));
+
+addedAnyGroup = true;
+
+
+
+// Load MTP media player handlers
+
+auto hlist = LoadHandlersForEventHandler(
+
+L"MTPMediaPlayerArrival", m_devicePath.c_str(), m_contentFlags);
+
+
+
+// Merge extra event handler handlers
+
+if (m_eventHandler != L"MTPMediaPlayerArrival" && !m_eventHandler.empty())
+
+{
+
+auto hlist2 = LoadHandlersForEventHandler(
+
+m_eventHandler.c_str(), m_devicePath.c_str(), m_contentFlags);
+
+for (auto& h2 : hlist2)
+
+{
+
+bool dup = false;
+
+for (auto& h1 : hlist) if (h1->id == h2->id) { dup = true; break; }
+
+if (!dup) hlist.push_back(h2);
+
+}
+
+}
+
+
+
+// Also try WPD handlers
+
+{
+
+auto hlistWPD = LoadHandlersForEventHandler(
+
+L"WPDArrival", m_devicePath.c_str(), m_contentFlags);
+
+for (auto& h2 : hlistWPD)
+
+{
+
+bool dup = false;
+
+for (auto& h1 : hlist) if (h1->id == h2->id) { dup = true; break; }
+
+if (!dup) hlist.push_back(h2);
+
+}
+
+}
+
+
+
+bool bPicturesOnly = (m_eventHandler == L"ShowPicturesOnArrival");
+
+bool hasOpenFolder = false;
+
+for (auto& h : hlist) if (h->id == HANDLER_OPEN_FOLDER) { hasOpenFolder = true; break; }
+
+
+
+std::shared_ptr<HandlerEntry> wpdHandler;
+
+hlist.erase(std::remove_if(hlist.begin(), hlist.end(),
+
+[bPicturesOnly, &wpdHandler](const std::shared_ptr<HandlerEntry>& h) -> bool
+
+{
+
+if (h->id == HANDLER_PROMPT_EACH || h->id == HANDLER_TAKE_NO_ACTION) return true;
+
+if (bPicturesOnly && (h->id == L"MSWMDMHandler" ||
+
+wcsstr(h->action.c_str(), L"Sync") != nullptr)) return true;
+
+if (h->id == L"MSWPDShellNamespaceHandler") { wpdHandler = h; return true; }
+
+if (h->id == HANDLER_OPEN_FOLDER) return true;
+
+return false;
+
+}), hlist.end());
+
+
+
+for (auto& h : hlist) { if (!h->hIcon) LoadHandlerIcon(*h, false); AddItem(h); }
+
+
+
+// Add "Open folder" if no WPD handler
+
+if (!hasOpenFolder && !wpdHandler)
+
+{
+
+auto general = LoadHandlersForEventHandler(
+
+L"UnknownContentOnArrival", m_devicePath.c_str(), m_contentFlags);
+
+for (auto& h : general)
+
+if (h->id == HANDLER_OPEN_FOLDER)
+
+{
+
+if (h->hIcon) { DestroyIcon(h->hIcon); h->hIcon = nullptr; }
+
+SHSTOCKICONINFO sii = { sizeof(sii) };
+
+if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_LARGEICON, &sii)))
+
+h->hIcon = sii.hIcon;
+
+if (!h->hIcon) LoadHandlerIcon(*h, false);
+
+AddItem(h); break;
+
+}
+
+}
+
+if (wpdHandler) { if (!wpdHandler->hIcon) LoadHandlerIcon(*wpdHandler, false); AddItem(wpdHandler); }
+
+}
+
+else
+
+{
+
+groups.push_back({ m_eventHandler, LoadStr(IDS_GROUP_DEVICE) });
+
+}
+
+}
+
+else if (bMixed)
+
+{
+
+AddGroup(GetStr(IDS_GROUP_MIXED));
+
+addedAnyGroup = true;
+
+std::unordered_set<std::wstring> added;
+
+const struct { DWORD flag; LPCWSTR handler; } types[] =
+
+{
+
+{ AUTOPLAY_CONTENT_MUSIC, L"PlayMusicFilesOnArrival" },
+
+{ AUTOPLAY_CONTENT_PICTURES, L"ShowPicturesOnArrival" },
+
+{ AUTOPLAY_CONTENT_VIDEO, L"PlayVideoFilesOnArrival" },
+
+{ AUTOPLAY_CONTENT_AUTORUN, L"HandleAutorunOnArrival" }
+
+};
+
+for (const auto& t : types)
+
+{
+
+if (!(m_contentFlags & t.flag)) continue;
+
+auto handlers = LoadHandlersForEventHandler(
+
+t.handler, m_devicePath.c_str(), m_contentFlags);
+
+for (auto& h : handlers)
+
+{
+
+if (!h || h->id == HANDLER_OPEN_FOLDER ||
+
+h->id == HANDLER_PROMPT_EACH || h->id == HANDLER_TAKE_NO_ACTION) continue;
+
+if (!added.insert(h->id).second) continue;
+
+if (!h->hIcon) LoadHandlerIcon(*h, false);
+
+AddItem(h);
+
+}
+
+}
+
+}
+
+else if (m_contentFlags)
+
+{
+
+for (int i = 0; i < g_nCt; ++i)
+
+if ((m_contentFlags & g_ct[i].flag) &&
+
+g_ct[i].flag != AUTOPLAY_CONTENT_OPENCPANEL &&
+
+g_ct[i].flag != AUTOPLAY_CONTENT_MIX)
+
+groups.push_back({ g_ct[i].eventHandler, LoadStr(g_ct[i].headerStringID) });
+
+}
+
+
+
+if (m_eventHandler.empty())
+
+{
+
+if (m_contentFlags & AUTOPLAY_CONTENT_MUSIC) m_eventHandler = L"PlayMusicFilesOnArrival";
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_PICTURES) m_eventHandler = L"ShowPicturesOnArrival";
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_VIDEO) m_eventHandler = L"PlayVideoFilesOnArrival";
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_AUTORUN) m_eventHandler = L"HandleAutorunOnArrival";
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_BLANK_CD) m_eventHandler = L"HandleCDBurningOnArrival";
+
+else if (m_contentFlags & AUTOPLAY_CONTENT_BLANK_DVD) m_eventHandler = L"HandleDVDBurningOnArrival";
+
+else if (bMixed) m_eventHandler = L"MixedContentOnArrival";
+
+}
+
+
+
+if (groups.empty() && !addedAnyGroup)
+
+groups.push_back({ L"UnknownContentOnArrival", LoadStr(IDS_GROUP_GENERAL) });
+
+
+
+for (auto& g : groups)
+
+{
+
+bool already = false;
+
+for (auto& u : usedKeys) if (u == g.first) { already = true; break; }
+
+if (already) continue;
+
+usedKeys.push_back(g.first);
+
+
+
+auto hlist = LoadHandlersForEventHandler(g.first.c_str(), m_devicePath.c_str(), m_contentFlags);
+
+bool bIsGeneral = (g.first == L"UnknownContentOnArrival");
+
+hlist.erase(std::remove_if(hlist.begin(), hlist.end(),
+
+[bIsGeneral](const std::shared_ptr<HandlerEntry>& h) -> bool
+
+{
+
+if (h->id == HANDLER_PROMPT_EACH || h->id == HANDLER_TAKE_NO_ACTION) return true;
+
+if (!bIsGeneral && h->id == HANDLER_OPEN_FOLDER) return true;
+
+return false;
+
+}), hlist.end());
+
+
+
+// Inject autorun entry if applicable
+
+if (m_contentFlags & AUTOPLAY_CONTENT_AUTORUN)
+
+{
+
+auto e2 = std::make_shared<HandlerEntry>();
+
+e2->id = L"MSAutoRun";
+
+WCHAR szInf[MAX_PATH]={}, szOpen[MAX_PATH]={}, szPub[256]={}, szIcon[MAX_PATH]={};
+
+StringCchPrintfW(szInf, ARRAYSIZE(szInf), L"%sautorun.inf", m_devicePath.c_str());
+
+GetPrivateProfileStringW(L"AutoRun.Amd64", L"open", L"", szOpen, ARRAYSIZE(szOpen), szInf);
+
+if (!szOpen[0]) GetPrivateProfileStringW(L"AutoRun", L"open", L"", szOpen, ARRAYSIZE(szOpen), szInf);
+
+GetPrivateProfileStringW(L"AutoRun.Amd64", L"label", L"", szPub, ARRAYSIZE(szPub), szInf);
+
+if (!szPub[0]) GetPrivateProfileStringW(L"AutoRun", L"label", L"", szPub, ARRAYSIZE(szPub), szInf);
+
+GetPrivateProfileStringW(L"AutoRun.Amd64", L"icon", L"", szIcon, ARRAYSIZE(szIcon), szInf);
+
+if (!szIcon[0]) GetPrivateProfileStringW(L"AutoRun", L"icon", L"", szIcon, ARRAYSIZE(szIcon), szInf);
+
+
+
+WCHAR szExe[MAX_PATH] = {};
+
+StringCchCopyW(szExe, ARRAYSIZE(szExe), szOpen);
+
+WCHAR* pSp = wcschr(szExe, L' '); if (pSp) *pSp = L'\0';
+
+if (szExe[0] == L'"') { memmove(szExe, szExe+1, wcslen(szExe)*sizeof(WCHAR)); WCHAR* pE=wcschr(szExe,L'"'); if(pE)*pE=L'\0'; }
+
+WCHAR* pN = PathFindFileNameW(szExe);
+
+e2->action = (pN && pN[0]) ? LoadStrFmt(IDS_RUN_EXE, pN) : LoadStr(IDS_RUN_PROGRAM);
+
+
+
+if (!szPub[0] && szExe[0])
+
+{
+
+WCHAR szFull[MAX_PATH]={};
+
+StringCchPrintfW(szFull,ARRAYSIZE(szFull),L"%s%s",m_devicePath.c_str(),szExe);
+
+DWORD dw=0, sz2=GetFileVersionInfoSizeW(szFull,&dw);
+
+if (sz2) {
+
+std::vector<BYTE> vb(sz2);
+
+if (GetFileVersionInfoW(szFull,0,sz2,vb.data())) {
+
+struct LCP{WORD l,c;}*lp; UINT cb=0;
+
+if (VerQueryValueW(vb.data(),L"\\VarFileInfo\\Translation",(LPVOID*)&lp,&cb)&&cb) {
+
+WCHAR q[256]={};
+
+StringCchPrintfW(q,ARRAYSIZE(q),L"\\StringFileInfo\\%04x%04x\\CompanyName",lp[0].l,lp[0].c);
+
+WCHAR*pC=nullptr; UINT ul=0;
+
+if (VerQueryValueW(vb.data(),q,(LPVOID*)&pC,&ul)&&pC&&pC[0])
+
+StringCchCopyW(szPub,ARRAYSIZE(szPub),pC);
+
+}
+
+}
+
+}
+
+}
+
+e2->provider = szPub[0] ? LoadStrFmt(IDS_PUBLISHED_BY,szPub) : LoadStr(IDS_PUBLISHER_NOT_SPECIFIED);
+
+
+
+if (szIcon[0])
+
+{
+
+WCHAR szIF[MAX_PATH]={};
+
+StringCchPrintfW(szIF,ARRAYSIZE(szIF),L"%s%s",m_devicePath.c_str(),szIcon);
+
+int iIdx=0; WCHAR*pC=wcsrchr(szIF,L','); if(pC){iIdx=_wtoi(pC+1);*pC=L'\0';}
+
+HICON hL=nullptr; ExtractIconExW(szIF,iIdx,&hL,nullptr,1); if(hL) e2->hIcon=hL;
+
+}
+
+if (!e2->hIcon) {
+
+SHSTOCKICONINFO si={sizeof(si)};
+
+if(SUCCEEDED(SHGetStockIconInfo(SIID_APPLICATION,SHGSI_ICON|SHGSI_LARGEICON,&si)))
+
+e2->hIcon=si.hIcon;
+
+}
+
+hlist.insert(hlist.begin(), e2);
+
+}
+
+
+
+if (hlist.empty()) continue;
+
+AddGroup(g.second.c_str());
+
+addedAnyGroup = true;
+
+for (auto& h : hlist)
+
+{
+
+if (h->id == HANDLER_OPEN_FOLDER)
+
+{
+
+if (h->hIcon) { DestroyIcon(h->hIcon); h->hIcon = nullptr; }
+
+SHSTOCKICONINFO sii={sizeof(sii)};
+
+if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER,SHGSI_ICON|SHGSI_LARGEICON,&sii)))
+
+h->hIcon=sii.hIcon;
+
+}
+
+else if (!h->hIcon) LoadHandlerIcon(*h, false);
+
+AddItem(h);
+
+}
+
+}
+
+
+
+// Always add General options section for non-device dialogs
+
+if (!m_forDevice)
+
+{
+
+bool alreadyHasGeneral = false;
+
+for (auto& u : usedKeys) if (u == L"UnknownContentOnArrival") { alreadyHasGeneral = true; break; }
+
+if (!alreadyHasGeneral)
+
+{
+
+auto hlist = LoadHandlersForEventHandler(
+
+L"UnknownContentOnArrival", m_devicePath.c_str(), m_contentFlags);
+
+hlist.erase(std::remove_if(hlist.begin(), hlist.end(),
+
+[](const std::shared_ptr<HandlerEntry>& h) -> bool
+
+{ return h->id == HANDLER_PROMPT_EACH || h->id == HANDLER_TAKE_NO_ACTION; }), hlist.end());
+
+if (!hlist.empty())
+
+{
+
+AddGroup(GetStr(IDS_GROUP_GENERAL));
+
+for (auto& h : hlist)
+
+{
+
+if (h->id == HANDLER_OPEN_FOLDER)
+
+{
+
+if (h->hIcon) { DestroyIcon(h->hIcon); h->hIcon = nullptr; }
+
+SHSTOCKICONINFO sii={sizeof(sii)};
+
+if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER,SHGSI_ICON|SHGSI_LARGEICON,&sii)))
+
+h->hIcon=sii.hIcon;
+
+}
+
+else if (!h->hIcon) LoadHandlerIcon(*h, false);
+
+AddItem(h);
+
+}
+
+}
+
+}
+
+}
+
+
+
+SendMessageW(m_hwndList, WM_SETREDRAW, TRUE, 0);
+
+RedrawWindow(m_hwndList, nullptr, nullptr, RDW_ERASE|RDW_FRAME|RDW_INVALIDATE|RDW_ALLCHILDREN);
+
+}
+
+
+
+void ClearList()
+
+{
+
+ListView_DeleteAllItems(m_hwndList);
+
+for (int i = m_groupId - 1; i >= 0; --i)
+
+ListView_RemoveGroup(m_hwndList, i);
+
+m_items.clear();
+
+m_groupId = 0;
+
+}
+
+
+
+void AddGroup(LPCWSTR label)
+
+{
+
+LVGROUP lg = {};
+
+lg.cbSize = sizeof(lg);
+
+lg.mask = LVGF_HEADER | LVGF_GROUPID | LVGF_STATE;
+
+lg.pszHeader = const_cast<LPWSTR>(label);
+
+lg.iGroupId = m_groupId;
+
+lg.state = LVGS_NORMAL;
+
+ListView_InsertGroup(m_hwndList, -1, &lg);
+
+m_groupId++;
+
+}
+
+
+
+void AddItem(std::shared_ptr<HandlerEntry> e)
+
+{
+
+int idx = ListView_GetItemCount(m_hwndList);
+
+m_items.push_back({ e });
+
+LVITEMW li = {};
+
+li.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_GROUPID;
+
+li.iItem = idx;
+
+li.pszText = const_cast<LPWSTR>(e->action.c_str());
+
+li.iImage = I_IMAGENONE;
+
+li.iGroupId = m_groupId - 1;
+
+ListView_InsertItem(m_hwndList, &li);
+
+}
+
+
+
+void Select(LPCWSTR id)
+
+{
+
+for (int i = 0; i < (int)m_items.size(); ++i)
+
+if (m_items[i].entry && (id == nullptr || !lstrcmpiW(m_items[i].entry->id.c_str(), id)))
+
+{
+
+ListView_SetItemState(m_hwndList, i,
+
+LVIS_SELECTED|LVIS_FOCUSED, LVIS_SELECTED|LVIS_FOCUSED);
+
+ListView_EnsureVisible(m_hwndList, i, FALSE);
+
+return;
+
+}
+
+if (!m_items.empty())
+
+{
+
+ListView_SetItemState(m_hwndList, 0,
+
+LVIS_SELECTED|LVIS_FOCUSED, LVIS_SELECTED|LVIS_FOCUSED);
+
+ListView_EnsureVisible(m_hwndList, 0, FALSE);
+
+}
+
+}
+
+
+
+void Resize(bool bChkVisible = false)
+
+{
+
+if (!m_hwndList) return;
+
+if (m_listOrigW == 0)
+
+{
+
+RECT rl; GetWindowRect(m_hwndList, &rl);
+
+m_listOrigW = rl.right - rl.left;
+
+}
+
+
+
+SetWindowPos(m_hwndList, nullptr, 0, 0, m_listOrigW, 4096,
+
+SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+UpdateWindow(m_hwndList);
+
+
+
+int cyNeeded = 60;
+
+if (!m_items.empty())
+
+{
+
+RECT rcL = {};
+
+if (ListView_GetItemRect(m_hwndList, (int)m_items.size()-1, &rcL, LVIR_BOUNDS))
+
+cyNeeded = rcL.bottom + 4;
+
+}
+
+
+
+int cyScreen = GetSystemMetrics(SM_CYSCREEN);
+
+RECT rdCur; GetWindowRect(m_hwnd, &rdCur);
+
+HWND hChk = GetDlgItem(m_hwnd, IDC_AUTOPLAY_ALWAYSDO);
+
+
+
+{
+
+RECT rChk={}, rList={};
+
+GetWindowRect(hChk, &rChk); GetWindowRect(m_hwndList, &rList);
+
+MapWindowPoints(nullptr, m_hwnd, (LPPOINT)&rList, 2);
+
+MapWindowPoints(nullptr, m_hwnd, (LPPOINT)&rChk, 2);
+
+if (!bChkVisible)
+
+{
+
+if (rList.top - rChk.top > 0)
+
+SetWindowPos(m_hwndList, nullptr, rList.left, rChk.top, 0, 0,
+
+SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+}
+
+else
+
+{
+
+int dt = rChk.top + (rChk.bottom - rChk.top) + 6;
+
+if (rList.top != dt)
+
+SetWindowPos(m_hwndList, nullptr, rList.left, dt, 0, 0,
+
+SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+}
+
+}
+
+
+
+RECT rlCur; GetWindowRect(m_hwndList, &rlCur);
+
+int cyAbove = rlCur.top - rdCur.top;
+
+int cyListMax = ((cyScreen * 60) / 100) - cyAbove - 28;
+
+if (cyListMax < 80) cyListMax = 80;
+
+int cyList = cyNeeded < 60 ? 60 : cyNeeded > cyListMax ? cyListMax : cyNeeded;
+
+
+
+LONG_PTR lvS = GetWindowLongPtrW(m_hwndList, GWL_STYLE);
+
+SetWindowLongPtrW(m_hwndList, GWL_STYLE,
+
+cyNeeded > cyList ? (lvS & ~LVS_NOSCROLL) : (lvS | LVS_NOSCROLL));
+
+SetWindowPos(m_hwndList, nullptr, 0, 0, m_listOrigW, cyList,
+
+SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+ListView_SetColumnWidth(m_hwndList, 0, m_listOrigW);
+
+
+
+HWND lnk = GetDlgItem(m_hwnd, IDC_AUTOPLAY_CPLLINK);
+
+if (lnk)
+
+{
+
+RECT rL={}, rk={};
+
+GetWindowRect(m_hwndList, &rL); MapWindowPoints(nullptr, m_hwnd, (LPPOINT)&rL, 2);
+
+GetWindowRect(lnk, &rk); MapWindowPoints(nullptr, m_hwnd, (LPPOINT)&rk, 2);
+
+SetWindowPos(lnk, nullptr, rk.left, rL.top + cyList + 8, 0, 0,
+
+SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+}
+
+int lnkH = 16;
+
+if (lnk) { RECT rk; GetWindowRect(lnk, &rk); lnkH = rk.bottom - rk.top; }
+
+SetWindowPos(m_hwnd, nullptr, 0, 0,
+
+rdCur.right - rdCur.left,
+
+cyAbove + cyList + 8 + lnkH + 20,
+
+SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+InvalidateRect(m_hwndList, nullptr, TRUE);
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// InitLV
+
+// -----------------------------------------------------------------------
+
+void InitLV()
+
+{
+
+LONG_PTR exS = GetWindowLongPtrW(m_hwndList, GWL_EXSTYLE);
+
+SetWindowLongPtrW(m_hwndList, GWL_EXSTYLE, exS & ~WS_EX_CLIENTEDGE);
+
+SetWindowPos(m_hwndList, nullptr, 0, 0, 0, 0,
+
+SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+
+SetWindowLongPtrW(m_hwndList, GWL_STYLE,
+
+GetWindowLongPtrW(m_hwndList, GWL_STYLE) | LVS_NOSCROLL);
+
+ListView_EnableGroupView(m_hwndList, TRUE);
+
+ListView_SetExtendedListViewStyle(m_hwndList,
+
+LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_ONECLICKACTIVATE);
+
+RECT rc; GetClientRect(m_hwndList, &rc);
+
+LVCOLUMNW c = { LVCF_WIDTH };
+
+c.cx = rc.right - rc.left;
+
+ListView_InsertColumn(m_hwndList, 0, &c);
+
+HIMAGELIST hil = ImageList_Create(1, 36, ILC_COLOR, 1, 1);
+
+ListView_SetImageList(m_hwndList, hil, LVSIL_STATE);
+
+const BYTE fontQuality = (IsAppThemed() && IsThemeActive())
+
+? CLEARTYPE_QUALITY : DEFAULT_QUALITY;
+
+m_hfList = CreateFontW(
+
+-MulDiv(8, GetDeviceCaps(GetDC(nullptr), LOGPIXELSY), 72),
+
+0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+
+DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+
+fontQuality, DEFAULT_PITCH|FF_SWISS, L"Tahoma");
+
+if (m_hfList) SendMessageW(m_hwndList, WM_SETFONT, (WPARAM)m_hfList, TRUE);
+
+SetWindowTheme(m_hwndList, L"Explorer", nullptr);
+
+HWND hLink = GetDlgItem(m_hwnd, IDC_AUTOPLAY_CPLLINK);
+
+if (hLink) SetWindowTheme(hLink, L"Explorer", nullptr);
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// ApplyTheme / FreeTheme
+
+// -----------------------------------------------------------------------
+
+void ApplyTheme()
+
+{
+
+m_hTheme = OpenThemeData(m_hwnd, L"TASKDIALOG");
+
+if (m_hTheme)
+
+{
+
+COLORREF clr = RGB(255, 255, 255);
+
+if (SUCCEEDED(GetThemeColor(m_hTheme, 1, 0, TMT_FILLCOLOR, &clr)))
+
+m_hbrBg = CreateSolidBrush(clr);
+
+
+
+LOGFONTW lf = {};
+
+if (SUCCEEDED(GetThemeFont(m_hTheme, nullptr, 2, 0, TMT_FONT, &lf)))
+
+{
+
+m_hfTitle = CreateFontIndirectW(&lf);
+
+if (m_hfTitle)
+
+for (int id : {IDC_AUTOPLAY_TITLE, IDC_AUTOPLAY_SEARCHING})
+
+SendDlgItemMessageW(m_hwnd, id, WM_SETFONT, (WPARAM)m_hfTitle, TRUE);
+
+}
+
+GetThemeColor(m_hTheme, 2, 0, TMT_TEXTCOLOR, &m_clrTitle);
+
+
+
+ZeroMemory(&lf, sizeof(lf));
+
+if (SUCCEEDED(GetThemeFont(m_hTheme, nullptr, 4, 0, TMT_FONT, &lf)))
+
+{
+
+m_hfBody = CreateFontIndirectW(&lf);
+
+if (m_hfBody)
+
+for (int id : {IDC_AUTOPLAY_ALWAYSDO, IDC_AUTOPLAY_CPLLINK, IDC_AUTOPLAY_NEWHANDLER})
+
+SendDlgItemMessageW(m_hwnd, id, WM_SETFONT, (WPARAM)m_hfBody, TRUE);
+
+}
+
+GetThemeColor(m_hTheme, 4, 0, TMT_TEXTCOLOR, &m_clrBody);
+
+}
+
+else
+
+{
+
+m_hbrBg = CreateSolidBrush(GetSysColor(COLOR_3DFACE));
+
+m_clrTitle = GetSysColor(COLOR_WINDOWTEXT);
+
+m_clrBody = GetSysColor(COLOR_WINDOWTEXT);
+
+}
+
+}
+
+
+
+void FreeTheme()
+
+{
+
+if (m_hTheme) { CloseThemeData(m_hTheme); m_hTheme = nullptr; }
+
+if (m_hbrBg) { DeleteObject(m_hbrBg); m_hbrBg = nullptr; }
+
+if (m_hfTitle){ DeleteObject(m_hfTitle); m_hfTitle = nullptr; }
+
+if (m_hfBody) { DeleteObject(m_hfBody); m_hfBody = nullptr; }
+
+if (m_hfList) { DeleteObject(m_hfList); m_hfList = nullptr; }
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// LoadDeviceIcon
+
+// -----------------------------------------------------------------------
+
+void LoadDeviceIcon()
+
+{
+
+auto it = g_deviceIcons.find(m_devicePath);
+
+if (it != g_deviceIcons.end() && it->second)
+
+{
+
+m_hiconDevice = it->second;
+
+m_bOwnIcon = false;
+
+}
+
+else
+
+{
+
+m_bOwnIcon = true;
+
+bool isMTPPath = m_devicePath.size() > 3 && m_devicePath[1] != L':';
+
+if (!m_iconLocation.empty())
+
+{
+
+WCHAR p[MAX_PATH*2] = {};
+
+StringCchCopyW(p, ARRAYSIZE(p), m_iconLocation.c_str());
+
+ExtractIconExW(p, PathParseIconLocationW(p), &m_hiconDevice, nullptr, 1);
+
+}
+
+else if (isMTPPath)
+
+{
+
+// Try shell32 cellphone icon (index 136 on Win10)
+
+WCHAR sz[MAX_PATH] = {};
+
+GetSystemDirectoryW(sz, MAX_PATH);
+
+StringCchCatW(sz, MAX_PATH, L"\\shell32.dll");
+
+HICON hL = nullptr;
+
+ExtractIconExW(sz, 136, &hL, nullptr, 1);
+
+if (hL) m_hiconDevice = hL;
+
+else
+
+{
+
+SHSTOCKICONINFO si = { sizeof(si) };
+
+if (SUCCEEDED(SHGetStockIconInfo((SHSTOCKICONID)SIID_DEVICECELLPHONE, SHGSI_ICON|SHGSI_LARGEICON, &si)))
+
+m_hiconDevice = si.hIcon;
+
+}
+
+}
+
+else if (!m_devicePath.empty())
+
+{
+
+SHFILEINFOW sfi = {};
+
+SHGetFileInfoW(m_devicePath.c_str(), 0, &sfi, sizeof(sfi),
+
+SHGFI_ICON|SHGFI_LARGEICON);
+
+m_hiconDevice = sfi.hIcon;
+
+}
+
+}
+
+if (m_hiconDevice)
+
+{
+
+SendDlgItemMessageW(m_hwnd, IDC_AUTOPLAY_ICON, STM_SETICON, (WPARAM)m_hiconDevice, 0);
+
+SendMessageW(m_hwnd, WM_SETICON, ICON_BIG, (LPARAM)m_hiconDevice);
+
+SendMessageW(m_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)m_hiconDevice);
+
+}
+
+}
+
+
+
+void Vis(int id, bool show)
+
+{
+
+HWND h = GetDlgItem(m_hwnd, id);
+
+if (h) ShowWindow(h, show ? SW_SHOW : SW_HIDE);
+
+}
+
+
+
+INT_PTR ColorStatic(HDC hdc, HWND hwndCtl)
+
+{
+
+if (!m_hbrBg) return FALSE;
+
+int id = GetDlgCtrlID(hwndCtl);
+
+if (id == IDC_AUTOPLAY_TITLE || id == IDC_AUTOPLAY_SEARCHING)
+
+SetTextColor(hdc, m_clrTitle);
+
+else if (id == IDC_AUTOPLAY_NEWHANDLER || id == IDC_AUTOPLAY_DEFAULT_MSG ||
+
+id == IDC_AUTOPLAY_CPLLINK)
+
+SetTextColor(hdc, m_clrBody);
+
+SetBkMode(hdc, TRANSPARENT);
+
+return (INT_PTR)m_hbrBg;
+
+}
+
+
+
+// -----------------------------------------------------------------------
+
+// Sniff thread (content detection for volumes)
+
+// -----------------------------------------------------------------------
+
+struct SP { CAutoplayDialog* p; HANDLE hReady; };
+
+
+
+static unsigned __stdcall SniffProc(void* arg)
+
+{
+
+auto* sp = reinterpret_cast<SP*>(arg);
+
+auto* p = sp->p;
+
+HANDLE hR = sp->hReady;
+
+delete sp;
+
+if (hR) WaitForSingleObject(hR, 10000);
+
+DWORD flags = DetectContent(p->m_devicePath.c_str());
+
+if (p->m_hwnd) PostMessageW(p->m_hwnd, WM_AUTOPLAY_NEWCONTENT, 0, (LPARAM)flags);
+
+Sleep(50);
+
+if (p->m_hwnd) PostMessageW(p->m_hwnd, WM_AUTOPLAY_SNIFFCOMPLETE, 0, (LPARAM)flags);
+
+return 0;
+
+}
+
+
+
+void Sniff()
+
+{
+
+auto* sp = new SP{ this, m_hReady };
+
+HANDLE h = (HANDLE)_beginthreadex(nullptr, 0, SniffProc, sp, 0, nullptr);
+
+if (h) CloseHandle(h); else delete sp;
+
+}
+
+};
+
+
+
+// ===========================================================================
+
+// ShowAutoPlayDialog public API
+
+// ===========================================================================
+
+static void ShowAutoPlayDialog(
+
+HWND hwndParent,
+
+LPCWSTR pwszDevicePath,
+
+LPCWSTR pwszLabel,
+
+LPCWSTR pwszIconLoc,
+
+LPCWSTR pwszEventHandler,
+
+DWORD dwContentFlags,
+
+bool bIsVolume)
+
+{
+
+const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+
+
+CAutoplayDialog dlg;
+
+dlg.m_devicePath = pwszDevicePath ? pwszDevicePath : L"";
+
+dlg.m_volumeLabel = pwszLabel ? pwszLabel : L"";
+
+dlg.m_iconLocation = pwszIconLoc ? pwszIconLoc : L"";
+
+dlg.m_eventHandler = pwszEventHandler ? pwszEventHandler : L"";
+
+dlg.m_contentFlags = dwContentFlags;
+
+dlg.m_isVolume = bIsVolume;
+
+dlg.m_forDevice = (!bIsVolume && pwszEventHandler && pwszEventHandler[0]);
+
+
+
+dlg.Show(hwndParent);
+
+
+
+if (hrCo == S_OK) CoUninitialize();
+
+}
+
+
+
+// ===========================================================================
+
+// SpawnParams / SpawnThread
+
+// ===========================================================================
+
+struct SpawnParams
+
+{
+
+std::wstring key;
+
+std::wstring label;
+
+std::wstring eventHandler;
+
+DWORD contentFlags;
+
+bool isVolume;
+
+};
+
+
+
+static DWORD WINAPI SpawnThread(LPVOID pv)
+
+{
+
+auto* p = reinterpret_cast<SpawnParams*>(pv);
+
+const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+
+
+if (p->isVolume && p->contentFlags == 0)
+
+p->contentFlags = DetectContent(p->key.c_str());
+
+
+
+ShowAutoPlayDialog(nullptr,
+
+p->key.c_str(),
+
+p->label.c_str(),
+
+nullptr,
+
+p->eventHandler.empty() ? nullptr : p->eventHandler.c_str(),
+
+p->contentFlags,
+
+p->isVolume);
+
+
+
+CloseDialogKey(p->key);
+
+RegisterKnownDevice(p->key.c_str());
+
+
+
+if (SUCCEEDED(hrCo)) CoUninitialize();
+
+delete p;
+
+return 0;
+
+}
+
+
+
+static std::wstring GetDriveLabel(LPCWSTR szPath)
+
+{
+
+WCHAR vol[MAX_PATH] = {};
+
+GetVolumeInformationW(szPath, vol, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
+
+if (vol[0])
+
+{
+
+WCHAR buf[256] = {};
+
+StringCchPrintfW(buf, ARRAYSIZE(buf), L"%s (%c:)", vol, szPath[0]);
+
+return buf;
+
+}
+
+return LoadStrFmt(IDS_REMOVABLE_DISK, szPath[0]);
+
+}
+
+
+
+static void SpawnVolumeDialog(LPCWSTR szPath, bool bFromDeviceChange)
+
+{
+
+Wh_Log(L"[SpawnVolumeDialog] path=%s fromDC=%d", szPath ? szPath : L"(null)", bFromDeviceChange);
+
+if (!szPath || !szPath[0]) { Wh_Log(L"[SpawnVolumeDialog] null/empty path"); return; }
+
+UINT t = GetDriveTypeW(szPath);
+
+Wh_Log(L"[SpawnVolumeDialog] DriveType=%u", t);
+
+if (t == DRIVE_NO_ROOT_DIR || t == DRIVE_UNKNOWN || t == DRIVE_REMOTE) { Wh_Log(L"[SpawnVolumeDialog] rejected: bad drive type"); return; }
+
+if (t != DRIVE_REMOVABLE && t != DRIVE_CDROM && t != DRIVE_FIXED) { Wh_Log(L"[SpawnVolumeDialog] rejected: not removable/cdrom/fixed"); return; }
+
+if (t == DRIVE_FIXED && !bFromDeviceChange) { Wh_Log(L"[SpawnVolumeDialog] rejected: fixed drive not from device change"); return; }
+
+
+
+if (!AutoPlay_IsAllowedForDrive(szPath)) { Wh_Log(L"[SpawnVolumeDialog] rejected: AutoPlay not allowed"); return; }
+
+if (IsKnownDevice(szPath)) { Wh_Log(L"[SpawnVolumeDialog] rejected: already known device"); return; }
+
+
+
+std::wstring key = szPath;
+
+if (!TryOpenDialog(key)) { Wh_Log(L"[SpawnVolumeDialog] rejected: TryOpenDialog failed"); return; }
+
+Wh_Log(L"[SpawnVolumeDialog] spawning thread for %s", szPath);
+
+
+
+std::wstring label = GetDriveLabel(szPath);
+
+auto* prm = new SpawnParams{ key, label, L"", 0, true };
+
+HANDLE h = CreateThread(nullptr, 0, SpawnThread, prm, 0, nullptr);
+
+if (h) CloseHandle(h);
+
+else { CloseDialogKey(key); delete prm; }
+
+}
+
+
+
+static void SpawnMTPDialog(const std::wstring& devId, const std::wstring& label)
+
+{
+
+if (IsKnownDevice(devId.c_str())) return;
+
+if (!TryOpenDialog(devId)) return;
+
+
+
+// Use ShowPicturesOnArrival as default dialog shows all WPD handlers
+
+auto* prm = new SpawnParams{ devId, label, L"ShowPicturesOnArrival", 0, false };
+
+HANDLE h = CreateThread(nullptr, 0, SpawnThread, prm, 0, nullptr);
+
+if (h) CloseHandle(h);
+
+else { CloseDialogKey(devId); delete prm; }
+
+}
+
+
+
+// ===========================================================================
+
+// Device interface GUIDs
+
+// ===========================================================================
+
+DEFINE_GUID(AP_GUID_VOLUME,
+
+0x53F5630D, 0xB6BF, 0x11D0,
+
+0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B);
+
+
+
+DEFINE_GUID(AP_GUID_WPD,
+
+0x6AC27878, 0xA6FA, 0x4155,
+
+0xBA, 0x85, 0xF9, 0x8F, 0x49, 0x1D, 0x4F, 0x33);
+
+
+
+DEFINE_GUID(AP_GUID_USB,
+
+0xA5DCBF10, 0x6530, 0x11D2,
+
+0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED);
+
+
+
+// ===========================================================================
+
+// Volume arrival: resolve interface path -> drive letter (with retry)
+
+// ===========================================================================
+
+static void OnVolumeArrived(const std::wstring& symLink)
+
+{
+
+Wh_Log(L"[OnVolumeArrived] symLink=%s", symLink.c_str());
+
+WCHAR szDrive[8] = {};
+
+for (int attempt = 0; attempt < 20 && !szDrive[0]; ++attempt)
+
+{
+
+if (attempt) Sleep(250);
+
+WCHAR drives[512] = {};
+
+GetLogicalDriveStringsW(ARRAYSIZE(drives) - 1, drives);
+
+for (WCHAR* p = drives; *p; p += wcslen(p) + 1)
+
+{
+
+WCHAR szNT[MAX_PATH] = {};
+
+WCHAR szLetter[3] = { p[0], L':', L'\0' };
+
+if (!QueryDosDeviceW(szLetter, szNT, ARRAYSIZE(szNT))) continue;
+
+
+
+// CM symlinks arrive as \\?\Volume{...} or \\?\STORAGE#Volume#...
+
+// QueryDosDevice returns \Device\HarddiskVolume...
+
+// Try direct compare first, then strip the \\?\ prefix and prepend \Device
+
+std::wstring ntLink = symLink;
+
+if (ntLink.size() > 4 &&
+
+(ntLink.substr(0, 4) == L"\\\\?\\" || ntLink.substr(0, 4) == L"\\\\.\\"))
+
+{
+
+ntLink = ntLink.substr(4); // strip \\?\ or \\\. (prefix removed)
+
+}
+
+// Also try with \Device\ prefix since QueryDosDevice returns that form
+
+std::wstring withDevice = L"\\Device\\" + ntLink;
+
+
+
+if (_wcsicmp(szNT, symLink.c_str()) == 0 ||
+
+_wcsicmp(szNT, ntLink.c_str()) == 0 ||
+
+_wcsicmp(szNT, withDevice.c_str()) == 0)
+
+{
+
+StringCchPrintfW(szDrive, ARRAYSIZE(szDrive), L"%c:\\", p[0]);
+
+Wh_Log(L"[OnVolumeArrived] matched drive %s (szNT=%s)", szDrive, szNT);
+
+break;
+
+}
+
+}
+
+}
+
+if (!szDrive[0])
+
+{
+
+// Last resort: if a new drive letter appeared since plugin loaded,
+
+// pick the first removable drive not previously seen.
+
+Wh_Log(L"[OnVolumeArrived] symlink match failed, trying removable drive scan");
+
+WCHAR drives[512] = {};
+
+GetLogicalDriveStringsW(ARRAYSIZE(drives) - 1, drives);
+
+for (WCHAR* p = drives; *p; p += wcslen(p) + 1)
+
+{
+
+if (GetDriveTypeW(p) == DRIVE_REMOVABLE && !IsKnownDevice(p))
+
+{
+
+StringCchCopyW(szDrive, ARRAYSIZE(szDrive), p);
+
+Wh_Log(L"[OnVolumeArrived] fallback: using removable drive %s", szDrive);
+
+break;
+
+}
+
+}
+
+}
+
+if (!szDrive[0]) { Wh_Log(L"[OnVolumeArrived] could not resolve drive, giving up"); return; }
+
+
+
+UINT driveType = GetDriveTypeW(szDrive);
+
+if (driveType == DRIVE_REMOTE || driveType == DRIVE_NO_ROOT_DIR) return;
+
+// Skip system drive (C:) unless it's removable or CD
+
+if (driveType == DRIVE_FIXED && towupper(szDrive[0]) == L'C') return;
+
+
+
+SpawnVolumeDialog(szDrive, true);
+
+}
+
+
+
+static void OnVolumeRemoved(const std::wstring& symLink)
+
+{
+
+WCHAR drives[512] = {};
+
+GetLogicalDriveStringsW(ARRAYSIZE(drives) - 1, drives);
+
+for (WCHAR* p = drives; *p; p += wcslen(p) + 1)
+
+{
+
+WCHAR szNT[MAX_PATH] = {};
+
+WCHAR szLetter[3] = { p[0], L':', L'\0' };
+
+if (!QueryDosDeviceW(szLetter, szNT, ARRAYSIZE(szNT))) continue;
+
+
+
+std::wstring ntLink;
+
+if (symLink.size() > 4 && symLink.substr(0, 4) == L"\\\\?\\")
+
+ntLink = L"\\Device\\" + symLink.substr(4);
+
+else
+
+ntLink = symLink;
+
+
+
+if (_wcsicmp(szNT, ntLink.c_str()) == 0)
+
+{
+
+WCHAR szKey[8] = {};
+
+StringCchPrintfW(szKey, ARRAYSIZE(szKey), L"%c:\\", p[0]);
+
+CloseAutoPlayDialogForDrive(p[0]);
+
+CloseDialogKey(szKey);
+
+UnregisterKnownDevice(szKey);
+
+break;
+
+}
+
+}
+
+}
+
+
+
+static void OnWPDArrived(const std::wstring& interfacePath)
+
+{
+
+Sleep(400); // Let WPD stack settle
+
+
+
+IPortableDeviceManager* pMgr = nullptr;
+
+if (FAILED(CoCreateInstance(CLSID_PortableDeviceManager, nullptr,
+
+CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pMgr))))
+
+return;
+
+
+
+DWORD dwCount = 0;
+
+pMgr->GetDevices(nullptr, &dwCount);
+
+if (dwCount == 0) { pMgr->Release(); return; }
+
+
+
+std::vector<LPWSTR> ids(dwCount, nullptr);
+
+pMgr->GetDevices(ids.data(), &dwCount);
+
+
+
+for (DWORD i = 0; i < dwCount; ++i)
+
+{
+
+if (!ids[i]) continue;
+
+std::wstring devId = ids[i];
+
+CoTaskMemFree(ids[i]);
+
+
+
+if (!TryOpenDialog(devId)) continue;
+
+
+
+WCHAR szName[256] = {};
+
+DWORD cch = ARRAYSIZE(szName);
+
+pMgr->GetDeviceFriendlyName(devId.c_str(), szName, &cch);
+
+
+
+std::wstring label = szName[0] ? szName : LoadStr(IDS_UNKNOWN_DEVICE);
+
+
+
+// Put back the key so SpawnMTPDialog can re-acquire it
+
+CloseDialogKey(devId);
+
+SpawnMTPDialog(devId, label);
+
+}
+
+pMgr->Release();
+
+}
+
+
+
+// ===========================================================================
+
+// Message window proc (runs on Explorer's main thread)
+
+// ===========================================================================
+
+struct DevArrival
+
+{
+
+std::wstring interfacePath;
+
+bool isVolume;
+
+bool isWPD;
+
+};
+
+
+
+static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
+
+{
+
+switch (msg)
+
+{
+
+case WM_AP_ARRIVED:
+
+{
+
+auto* ev = reinterpret_cast<DevArrival*>(l);
+
+if (!ev) return 0;
+
+if (ev->isVolume)
+
+{
+
+struct VA { std::wstring path; };
+
+auto* va = new VA{ ev->interfacePath };
+
+HANDLE h = CreateThread(nullptr, 0, [](LPVOID pv) __attribute__((stdcall)) -> DWORD {
+
+auto* va2 = reinterpret_cast<VA*>(pv);
+
+HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+OnVolumeArrived(va2->path);
+
+if (SUCCEEDED(hr)) CoUninitialize();
+
+delete va2; return 0;
+
+}, va, 0, nullptr);
+
+if (h) CloseHandle(h); else delete va;
+
+}
+
+else if (ev->isWPD)
+
+{
+
+struct WA { std::wstring path; };
+
+auto* wa = new WA{ ev->interfacePath };
+
+HANDLE h = CreateThread(nullptr, 0, [](LPVOID pv) __attribute__((stdcall)) -> DWORD {
+
+auto* wa2 = reinterpret_cast<WA*>(pv);
+
+HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+OnWPDArrived(wa2->path);
+
+if (SUCCEEDED(hr)) CoUninitialize();
+
+delete wa2; return 0;
+
+}, wa, 0, nullptr);
+
+if (h) CloseHandle(h); else delete wa;
+
+}
+
+delete ev;
+
+return 0;
+
+}
+
+
+
+case WM_AP_REMOVED:
+
+{
+
+auto* ev = reinterpret_cast<DevArrival*>(l);
+
+if (!ev) return 0;
+
+if (ev->isVolume)
+
+OnVolumeRemoved(ev->interfacePath);
+
+else
+
+{
+
+CloseAutoPlayDialogForDevice(ev->interfacePath.c_str());
+
+CloseDialogKey(ev->interfacePath);
+
+UnregisterKnownDevice(ev->interfacePath.c_str());
+
+auto it = g_deviceIcons.find(ev->interfacePath);
+
+if (it != g_deviceIcons.end())
+
+{
+
+if (it->second) DestroyIcon(it->second);
+
+g_deviceIcons.erase(it);
+
+}
+
+}
+
+delete ev;
+
+return 0;
+
+}
+
+case WM_DEVICECHANGE:
+
+{
+
+auto* hdr = reinterpret_cast<DEV_BROADCAST_HDR*>(l);
+
+if (w == DBT_DEVICEARRIVAL)
+
+{
+
+if (hdr && hdr->dbch_devicetype == DBT_DEVTYP_VOLUME)
+
+{
+
+Wh_Log(L"[MsgWnd WM_DEVICECHANGE] DBT_DEVTYP_VOLUME arrival");
+
+auto* vol = reinterpret_cast<DEV_BROADCAST_VOLUME*>(l);
+
+TrySpawnVolumeDialogForMask(vol->dbcv_unitmask);
+
+}
+
+else
+
+{
+
+Wh_Log(L"[MsgWnd WM_DEVICECHANGE] DBT_DEVICEARRIVAL type=%u",
+
+hdr ? hdr->dbch_devicetype : 0);
+
+}
+
+}
+
+else if (w == DBT_DEVICEREMOVECOMPLETE)
+
+{
+
+if (hdr && hdr->dbch_devicetype == DBT_DEVTYP_VOLUME)
+
+{
+
+auto* vol = reinterpret_cast<DEV_BROADCAST_VOLUME*>(l);
+
+DWORD mask = vol->dbcv_unitmask;
+
+for (int i = 0; i < 26; i++)
+
+{
+
+if (!(mask & (1u << i))) continue;
+
+WCHAR szDrive[4] = { (WCHAR)(L'A' + i), L':', L'\\', L'\0' };
+
+Wh_Log(L"[MsgWnd WM_DEVICECHANGE] Volume removed: %s", szDrive);
+
+CloseAutoPlayDialogForDrive(L'A' + i); // close open dialog
+
+UnregisterKnownDevice(szDrive); // allow re-trigger on next insert
+
+CloseDialogKey(std::wstring(szDrive));
+
+}
+
+}
+
+}
+
+return TRUE;
+
+}
+
+
+
+}
+
+return DefWindowProcW(hwnd, msg, w, l);
+
+}
+
+
+
+// ===========================================================================
+
+// CM_Register_Notification callback
+
+// (fires on a CM threadpool thread, posts to our message window)
+
+// ===========================================================================
+
+static DWORD CALLBACK CMCallback(
+
+HCMNOTIFICATION /*hNotify*/,
+
+PVOID pContext,
+
+CM_NOTIFY_ACTION action,
+
+PCM_NOTIFY_EVENT_DATA pData,
+
+DWORD /*cbData*/)
+
+{
+
+HWND hwnd = reinterpret_cast<HWND>(pContext);
+
+if (!hwnd) return ERROR_SUCCESS;
+
+if (pData->FilterType != CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE)
+
+return ERROR_SUCCESS;
+
+if (action != CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL &&
+
+action != CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL)
+
+return ERROR_SUCCESS;
+
+
+
+const GUID& cls = pData->u.DeviceInterface.ClassGuid;
+
+bool isVol = IsEqualGUID(cls, AP_GUID_VOLUME);
+
+bool isWPD = IsEqualGUID(cls, AP_GUID_WPD) || IsEqualGUID(cls, AP_GUID_USB);
+
+if (!isVol && !isWPD) return ERROR_SUCCESS;
+
+
+
+auto* ev = new (std::nothrow) DevArrival{
+
+pData->u.DeviceInterface.SymbolicLink, isVol, isWPD
+
+};
+
+if (!ev) return ERROR_SUCCESS;
+
+
+
+UINT uMsg = (action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL)
+
+? WM_AP_ARRIVED : WM_AP_REMOVED;
+
+
+
+if (!PostMessageW(hwnd, uMsg, 0, reinterpret_cast<LPARAM>(ev)))
+
+delete ev;
+
+
+
+return ERROR_SUCCESS;
+
+}
+
+
+
+// ===========================================================================
+
+// Windhawk entry points
+
+// ===========================================================================
+
+// ===========================================================================
+
+// ShellExecuteExW hook intercepts right-click "Open AutoPlay..." verb
+
+// ===========================================================================
+
+using ShellExecuteExW_t = decltype(&ShellExecuteExW);
+
+static ShellExecuteExW_t orig_ShellExecuteExW = nullptr;
+
+
+
+static BOOL WINAPI hook_ShellExecuteExW(SHELLEXECUTEINFOW* psei)
+
+{
+
+if (psei && psei->lpVerb &&
+
+_wcsicmp(psei->lpVerb, L"autoplay") == 0 &&
+
+psei->lpFile && psei->lpFile[0])
+
+{
+
+WCHAR szDrive[MAX_PATH] = {};
+
+StringCchCopyW(szDrive, ARRAYSIZE(szDrive), psei->lpFile);
+
+size_t len = wcslen(szDrive);
+
+if (len > 0 && szDrive[len-1] != L'\\') {
+
+szDrive[len] = L'\\'; szDrive[len+1] = L'\0';
+
+}
+
+Wh_Log(L"[ShellExecuteExW] autoplay verb for %s -> Win7 dialog", szDrive);
+
+UnregisterKnownDevice(szDrive); // force show even if already seen
+
+SpawnVolumeDialog(szDrive, true);
+
+return TRUE;
+
+}
+
+return orig_ShellExecuteExW ? orig_ShellExecuteExW(psei) : FALSE;
+
+}
+
+
+
+BOOL Wh_ModInit()
+
+{
+
+Wh_Log(L"Win7 AutoPlay Dialog mod initializing");
+
+InitializeCriticalSection(&g_csKnownDevices);
+
+
+
+
+
+g_hInstance = GetModuleHandleW(nullptr); // Explorer's hInstance
+
+
+
+INITCOMMONCONTROLSEX icc = { sizeof(icc) };
+
+icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_LINK_CLASS |
+
+ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
+
+InitCommonControlsEx(&icc);
+
+
+
+// Register our message window class
+
+WNDCLASSEXW wc = { sizeof(wc) };
+
+wc.lpfnWndProc = MsgWndProc;
+
+wc.hInstance = g_hInstance;
+
+wc.lpszClassName = L"Win7AutoPlayMsgWnd";
+
+RegisterClassExW(&wc);
+
+
+
+// Use a normal (non-message-only) hidden window so it receives
+
+// WM_DEVICECHANGE broadcasts from the OS. HWND_MESSAGE windows are
+
+// excluded from broadcast messages (see deviceinstallux pattern).
+
+g_hwndMsg = CreateWindowExW(0, L"Win7AutoPlayMsgWnd", nullptr,
+
+WS_OVERLAPPED, 0, 0, 0, 0,
+
+nullptr, nullptr, g_hInstance, nullptr);
+
+
+
+if (!g_hwndMsg)
+
+{
+
+Wh_Log(L"Failed to create message window: %lu", GetLastError());
+
+return FALSE;
+
+}
+
+
+
+// Belt-and-suspenders: also register for WM_DEVICECHANGE broadcasts
+
+// (CM_Register_Notification alone misses some insertion events on Win10/11)
+
+{
+
+DEV_BROADCAST_DEVICEINTERFACE dbdi = {};
+
+dbdi.dbcc_size = sizeof(dbdi);
+
+dbdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+
+HDEVNOTIFY hdn = RegisterDeviceNotificationW(
+
+g_hwndMsg, &dbdi,
+
+DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
+
+if (hdn)
+
+Wh_Log(L"RegisterDeviceNotification registered on message window");
+
+else
+
+Wh_Log(L"RegisterDeviceNotification failed: %lu", GetLastError());
+
+}
+
+
+
+// Initialize critical sections
+
+EnsureDialogCS();
+
+EnsureDialogsCS();
+
+
+
+// Register IQueryCancelAutoPlay to suppress Explorer's own AutoPlay toast
+
+RegisterCancelAutoPlay();
+
+
+
+// Register CM notification for device arrivals
+
+CM_NOTIFY_FILTER cmf = { sizeof(cmf) };
+
+cmf.FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+
+cmf.u.DeviceInterface.ClassGuid = GUID_NULL; // all interface classes
+
+
+
+CONFIGRET cr = CM_Register_Notification(&cmf, g_hwndMsg, CMCallback, &g_hCMNotify);
+
+if (cr != CR_SUCCESS)
+
+Wh_Log(L"CM_Register_Notification failed: %u", cr);
+
+
+
+// Hook DispatchMessageW as a third layer of device detection
+
+// (catches WM_DEVICECHANGE already flowing through explorer's message loop)
+
+Wh_SetFunctionHook((void*)DispatchMessageW,
+
+(void*)hook_DispatchMessageW, (void**)&orig_DispatchMessageW);
+
+
+
+// Hook ShellExecuteExW to intercept the right-click "Open AutoPlay..." verb
+
+Wh_SetFunctionHook((void*)ShellExecuteExW,
+
+(void*)hook_ShellExecuteExW, (void**)&orig_ShellExecuteExW);
+
+Wh_Log(L"Hooked ShellExecuteExW for autoplay verb");
+
+
+
+Wh_Log(L"Win7 AutoPlay Dialog mod loaded successfully");
+
+return TRUE;
+
+}
+
+
+
+void Wh_ModUninit()
+
+{
+
+Wh_Log(L"Win7 AutoPlay Dialog mod unloading");
+
+g_knownDevices.clear();
+
+DeleteCriticalSection(&g_csKnownDevices);
+
+
+
+// Unregister IQueryCancelAutoPlay
+
+UnregisterCancelAutoPlay();
+
+
+
+// Unregister CM notification
+
+if (g_hCMNotify)
+
+{
+
+CM_Unregister_Notification(g_hCMNotify);
+
+g_hCMNotify = nullptr;
+
+}
+
+
+
+// Destroy message window
+
+if (g_hwndMsg)
+
+{
+
+DestroyWindow(g_hwndMsg);
+
+g_hwndMsg = nullptr;
+
+}
+
+
+
+// Clean up device icon cache
+
+for (auto& kv : g_deviceIcons)
+
+if (kv.second) DestroyIcon(kv.second);
+
+g_deviceIcons.clear();
+
+
+
+// Clean up critical sections
+
+if (g_csDialogKeysInit)
+
+{
+
+DeleteCriticalSection(&g_csDialogKeys);
+
+g_csDialogKeysInit = false;
+
+}
+
+if (g_csDialogsInit)
+
+{
+
+DeleteCriticalSection(&g_csDialogs);
+
+g_csDialogsInit = false;
+
+}
+
+
+
+Wh_Log(L"Win7 AutoPlay Dialog mod unloaded");
+
+}
+

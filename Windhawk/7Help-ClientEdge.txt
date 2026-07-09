@@ -1,0 +1,78 @@
+// ==WindhawkMod==
+// @id              helpandsupport-clientedge
+// @name            Help and Support ClientEdge
+// @description     Adds Clientedge to Help and Support
+// @version         1.0.0
+// @author          ThatThomasDude
+// @include         helppane.exe
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+
+This mod adds back ClientEdge to Help and Support, just like Windows Vista before 8. (Based on Notepad Clientedge mod by aubymori)
+
+*/
+// ==/WindhawkModReadme==
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+CreateWindowExW_t CreateWindowExW_orig;
+HWND WINAPI CreateWindowExW_hook(
+    DWORD     dwExStyle,
+    LPCWSTR   lpClassName,
+    LPCWSTR   lpWindowName,
+    DWORD     dwStyle,
+    int       X,
+    int       Y,
+    int       nWidth,
+    int       nHeight,
+    HWND      hWndParent,
+    HMENU     hMenu,
+    HINSTANCE hInstance,
+    LPVOID    lpParam
+)
+{
+    if (hWndParent != NULL
+    && ((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0
+    &&  !wcsicmp(lpClassName, L"Shell Embedding"))
+    {
+        WCHAR szParentClass[256];
+        if (GetClassNameW(hWndParent, szParentClass, 256))
+        {
+            if (!wcsicmp(szParentClass, L"HelpPane.WebBrowser"))
+            {
+                dwExStyle |= WS_EX_CLIENTEDGE;
+            }
+        }
+    }
+
+    return CreateWindowExW_orig(
+        dwExStyle,
+        lpClassName,
+        lpWindowName,
+        dwStyle,
+        X,
+        Y,
+        nWidth,
+        nHeight,
+        hWndParent,
+        hMenu,
+        hInstance,
+        lpParam
+    );
+}
+
+BOOL Wh_ModInit(void)
+{
+    if (!Wh_SetFunctionHook(
+        (void *)CreateWindowExW,
+        (void *)CreateWindowExW_hook,
+        (void **)&CreateWindowExW_orig
+    ))
+    {
+        Wh_Log(L"Failed to hook CreateWindowExW");
+        return FALSE;
+    }
+
+    return TRUE;
+}

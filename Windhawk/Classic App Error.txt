@@ -1,0 +1,118 @@
+// ==WindhawkMod==
+// @id              restore-classic-app-error
+// @name            Restore Classic App Error Dialog
+// @description     Restores the legacy app error dialogs from Windows XP - 7 as requested by somebody named ThatThomasDude
+// @version         1.0.0
+// @author          yanashubby (kieldbg)
+// @github          https://github.com/kieldbg
+// @include         explorer.exe
+// @compilerOptions -luser32
+// ==/WindhawkMod==
+
+#include <windhawk_utils.h>
+
+const int ERR_BAD_FORMAT = 0x800700C1;
+const int ERR_MACHINE_TYPE_MISMATCH = 0x800700D8;
+
+typedef int (WINAPI *ShellMessageBoxW_t)(HINSTANCE hAppInst, HWND hWnd, LPCWSTR lpcText, LPCWSTR lpcTitle, UINT fuStyle, ...);
+ShellMessageBoxW_t pShellMessageBoxW = nullptr;
+
+typedef void (*SHExecuteErrorMessageBox_t)(int a1, HWND a2, int a3, PCWSTR a4, PCWSTR a5);
+SHExecuteErrorMessageBox_t SHExecuteErrorMessageBox_orig = nullptr;
+
+typedef HRESULT (*ExecuteModernErrorDialog_t)(HWND a1, long a2, unsigned int a3, unsigned int a4);
+ExecuteModernErrorDialog_t ExecuteModernErrorDialog_orig = nullptr;
+
+void SHExecuteErrorMessageBox_hook(int a1, HWND a2, int a3, PCWSTR a4, PCWSTR a5) {
+    if (a1 != 0 && a5 != nullptr) {
+        if (a3 == ERR_BAD_FORMAT || a3 == ERR_MACHINE_TYPE_MISMATCH) {
+            HMODULE Shell32 = GetModuleHandleW(L"shell32.dll");
+            pShellMessageBoxW = (ShellMessageBoxW_t)GetProcAddress(Shell32, "ShellMessageBoxW");
+
+            if (pShellMessageBoxW) {
+                WCHAR szMessage[512];
+                bool gotMessage = false;
+
+                if (a3 == ERR_BAD_FORMAT) {
+                    HMODULE Kernel32 = GetModuleHandleW(L"kernel32.dll");
+                    if (Kernel32) {
+                        DWORD result = FormatMessageW(
+                            FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_IGNORE_INSERTS,
+                            Kernel32, 0xC1, 0, szMessage, ARRAYSIZE(szMessage), nullptr
+                        );
+                        gotMessage = result > 0;
+                    }
+                    if (!gotMessage) {
+                        wcsncpy(szMessage, L"%1 is not a valid Win32 application.", ARRAYSIZE(szMessage));
+                        gotMessage = true;
+                    }
+                } else if (a3 == ERR_MACHINE_TYPE_MISMATCH) {
+                    HMODULE KernelBase = GetModuleHandleW(L"kernelbase.dll");
+                    if (KernelBase) {
+                        DWORD result = FormatMessageW(
+                            FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_IGNORE_INSERTS,
+                            KernelBase, 0xD8, 0, szMessage, ARRAYSIZE(szMessage), nullptr
+                        );
+                        gotMessage = result > 0;
+                    }
+                    if (!gotMessage) {
+                        wcsncpy(szMessage, L"The version of this file is not compatible with the version of Windows you're running. Check your computer's system information to see whether you need an x86 (32-bit) or x64 (64-bit) version of the program, and then contact the software publisher.", ARRAYSIZE(szMessage));
+                        gotMessage = true;
+                    }
+                }
+
+                if (gotMessage) {
+                    pShellMessageBoxW(
+                        Shell32, a2,
+                        szMessage,
+                        a5, MB_ICONERROR | MB_OK, a5
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    SHExecuteErrorMessageBox_orig(a1, a2, a3, a4, a5);
+}
+
+HRESULT ExecuteModernErrorDialog_hook(HWND a1, long a2, unsigned int a3, unsigned int a4) {
+    return 0x80040154; 
+}
+
+BOOL Wh_ModInit() {
+    HMODULE Shell32 = LoadLibraryW(L"shell32.dll");
+    if (!Shell32) return FALSE;
+
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {
+                L"void __cdecl SHExecuteErrorMessageBox(int,struct HWND__ *,long,unsigned short const *,unsigned short *)",
+                L"void __cdecl SHExecuteErrorMessageBox(int,struct HWND__ *,int,unsigned short const *,unsigned short *)",
+                L"void __cdecl SHExecuteErrorMessageBox(bool,struct HWND__ *,long,unsigned short const *,unsigned short *)",
+                L"void __cdecl SHExecuteErrorMessageBox(int,struct HWND__ *,long,wchar_t const *,wchar_t *)",
+                L"SHExecuteErrorMessageBox"
+            },
+            (void**)&SHExecuteErrorMessageBox_orig,
+            (void*)SHExecuteErrorMessageBox_hook,
+            false
+        },
+        {
+            {
+                L"long __cdecl _ExecuteModernErrorDialog(struct HWND__ *,long,unsigned int,unsigned int)",
+                L"long __cdecl _ExecuteModernErrorDialog(struct HWND__ *,int,unsigned int,unsigned int)",
+                L"long __stdcall _ExecuteModernErrorDialog(struct HWND__ *,long,unsigned int,unsigned int)",
+                L"_ExecuteModernErrorDialog"
+            },
+            (void**)&ExecuteModernErrorDialog_orig,
+            (void*)ExecuteModernErrorDialog_hook,
+            false
+        }
+    };
+
+    return WindhawkUtils::HookSymbols(Shell32, hooks, 2);
+}
+
+void Wh_ModUninit() {
+
+}
