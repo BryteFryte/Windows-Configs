@@ -16,6 +16,7 @@ Here you will find everything that I use for my Windows install that make my dai
 <li>Old Auto Colorization (Windows Auto Color Picker worked differently between 11, 10, an 8. It gradually became duller and darker at least with what I noticed. I use the Windows 8 option so that way if I choose a new wallpaper the Accent Window Border and Taskbar have brighter colors.)</li>
 <li>Taskbar Restart Explorer</li>
 <li>Windows 11 Accent Window Border (Adds the accent color to the sides of the window without having to enable colored titlebars in the settings)</li>
+<br>
 # Registry Tweaks
 <li>Add Reg Owner and Reg Org to Winver (You'll have to edit the file in notepad to get it what you want it to say)</li>
 <li>Add DWORD value for Logon & Sleep Fade Restorer WH mod</li>
@@ -27,6 +28,8 @@ Here you will find everything that I use for my Windows install that make my dai
 # Group Policy Editor
 I only have 1 thing changed and its "Select the target Feature Update Version", basically what this does is it prevents from upgrading to the next big release update that Microsoft pushes every year, I have 25H2, so entering 25H2 into the field will NOT give me the 26H2 update when it releases. I do this because upgrading major versions gives me issues with my system configs and programs, I don't wanna have to edit them all over again. But if you were wanting to go the next version of Windows after some time has past, then you can just set the setting to Not Configured which is its default state. To find this, go to Administrative Templates > Windows Components > Windows Update > Manage updates offered from Windows Update.
 <img src="Screenshots/GPEDIT.png" width="100%">
+<br>
 # Other things
 I do have a lot of other tweaks involving background tasks and general "privacy" bullshit that I only really use for performance, I'd say if you're looking for stuff like that check out the Chris Titus Windows Utility cause it is the easiest to figure out along with a lot of information + toggles.
+<br>
 <img src="Screenshots/DancingLights.gif" width="100%">
